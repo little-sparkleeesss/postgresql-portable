@@ -181,59 +181,28 @@ if [[ -f libpq.so.5.18 ]]; then
     echo "  libpq symlinks created"
 fi
 
-echo "=== Step 11: Set interpreter + RPATH (replace wrapper scripts) ==="
+echo "=== Step 11: Create launcher wrappers ==="
 LD_LINUX_NAME="ld-linux-x86-64.so.2"
-# Use a short path that the user creates a symlink for via setup.sh
-INTERP_PATH="/tmp/.pg/lib/${LD_LINUX_NAME}"
 
 for bin in "${BUNDLE}/bin/"*; do
     [[ -f "${bin}" ]] || continue
     bname="$(basename "${bin}")"
     ft=$(file -b "${bin}" 2>/dev/null || true)
     if echo "${ft}" | grep -qE 'ELF.*executable'; then
-        # Set interpreter to bundled ld-linux via a fixed symlink path
-        patchelf --set-interpreter "${INTERP_PATH}" "${bin}" 2>/dev/null || {
-            echo "  WARNING: --set-interpreter failed for ${bname}, keeping wrapper"
-            mv "${bin}" "${bin}.real"
-            cat > "${bin}" <<'WRAPOF'
+        mv "${bin}" "${bin}.real"
+        cat > "${bin}" <<WRAPOF
 #!/bin/sh
-DIR="$(dirname "$(readlink -f "$0")")"
-BASENAME="$(basename "$0")"
-exec "${DIR}/../lib/ld-linux-x86-64.so.2" --library-path "${DIR}/../lib" "${DIR}/${BASENAME}.real" "$@"
+SELF_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+BASENAME="\${0##*/}"
+LD_LINUX="\${SELF_DIR}/../lib/${LD_LINUX_NAME}"
+LIB_DIR="\${SELF_DIR}/../lib"
+REAL_BIN="\${SELF_DIR}/\${BASENAME}.real"
+exec "\${LD_LINUX}" --library-path "\${LIB_DIR}" "\${REAL_BIN}" "\$@"
 WRAPOF
-            chmod +x "${bin}"
-        }
-        echo "  Interpreter: ${bname}"
+        chmod +x "${bin}"
+        echo "  Wrapper: ${bname}"
     fi
 done
-
-# Create setup.sh that creates the symlink needed by the interpreter
-cat > "${BUNDLE}/setup.sh" <<SETUPEOF
-#!/bin/sh
-# Create the symlink that patchelf'd binaries expect for their interpreter
-BUNDLE_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-INTERP_LINK="${INTERP_PATH}"
-INTERP_SRC="\${BUNDLE_DIR}/lib/${LD_LINUX_NAME}"
-
-mkdir -p "\$(dirname "\${INTERP_LINK}")"
-if [ ! -f "\${INTERP_LINK}" ]; then
-    ln -sf "\${INTERP_SRC}" "\${INTERP_LINK}" 2>/dev/null || {
-        # If can't symlink (no permission), try copying
-        cp "\${INTERP_SRC}" "\${INTERP_LINK}" 2>/dev/null || true
-    }
-    echo "Interpreter link created: \${INTERP_LINK} -> \${INTERP_SRC}"
-else
-    echo "Interpreter link already exists: \${INTERP_LINK}"
-fi
-echo "Portable PostgreSQL ready at: \${BUNDLE_DIR}"
-echo ""
-echo "Usage:"
-echo "  \${BUNDLE_DIR}/bin/psql -h host -U user"
-echo "  \${BUNDLE_DIR}/bin/initdb -D /path/to/data   # full mode"
-echo "  \${BUNDLE_DIR}/bin/pg_ctl -D /path/to/data start  # full mode"
-SETUPEOF
-chmod +x "${BUNDLE}/setup.sh"
-echo "  Created setup.sh"
 
 # ── Full-mode extras ─────────────────────────────────────────────────
 if [[ "${BUILD_MODE}" = "full" ]]; then
@@ -264,6 +233,44 @@ if [[ "${BUILD_MODE}" = "full" ]]; then
         patchelf --set-rpath '$ORIGIN/..' "${ext}" 2>/dev/null || true
     done
     echo "  Patched RPATH on server extensions"
+
+    # Collect missing deps from server extensions (not scanned in Step 6)
+    echo "=== Step 11c: Collect missing deps from server extensions ==="
+    declare -A ext_seen
+    for ext in "${BUNDLE}/lib/postgresql/"*.so; do
+        [[ -f "${ext}" ]] || continue
+        while read -r line; do
+            if [[ "${line}" =~ =\>[[:space:]]+(.+)[[:space:]]+\( ]]; then
+                libpath="${BASH_REMATCH[1]}"
+                libname="$(basename "${libpath}")"
+                if echo "${libname}" | grep -qE "${no_patch}"; then
+                    continue
+                fi
+                if [[ -f "${BUNDLE}/lib/${libname}" ]]; then
+                    continue
+                fi
+                if [[ -n "${libpath}" && -f "${libpath}" ]]; then
+                    if [[ -z "${ext_seen[${libname}]:-}" ]]; then
+                        ext_seen["${libname}"]="${libpath}"
+                    fi
+                fi
+            fi
+        done < <(ldd "${ext}" 2>/dev/null)
+    done
+
+    if [[ ${#ext_seen[@]} -gt 0 ]]; then
+        echo "  Found ${#ext_seen[@]} missing deps"
+        for libname in "${!ext_seen[@]}"; do
+            src="${ext_seen[${libname}]}"
+            dst="${BUNDLE}/lib/${libname}"
+            cp -L "${src}" "${dst}" 2>/dev/null || true
+            patchelf --remove-rpath "${dst}" 2>/dev/null || true
+            patchelf --set-rpath '$ORIGIN' "${dst}" 2>/dev/null || true
+            echo "  Copied: ${libname}"
+        done
+    else
+        echo "  No missing deps found"
+    fi
 fi
 
 echo "=== Step 12: Verify ==="
@@ -274,14 +281,9 @@ echo ""
 echo "--- lib/ (count: $(ls -1 "${BUNDLE}/lib/" | wc -l)) ---"
 ls -la "${BUNDLE}/lib/"
 echo ""
-echo "--- Running setup.sh (creates interpreter symlink) ---"
-if [[ -x "${BUNDLE}/setup.sh" ]]; then
-    "${BUNDLE}/setup.sh" 2>&1 || true
-fi
-echo ""
-echo "--- ldd psql ---"
-if [[ -f "${BUNDLE}/bin/psql" ]]; then
-    ldd "${BUNDLE}/bin/psql" 2>&1 || true
+echo "--- ldd psql.real (library resolution via RPATH) ---"
+if [[ -f "${BUNDLE}/bin/psql.real" ]]; then
+    ldd "${BUNDLE}/bin/psql.real" 2>&1 || true
 fi
 echo ""
 echo "--- Testing psql --version ---"
