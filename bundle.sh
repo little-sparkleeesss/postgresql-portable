@@ -7,7 +7,7 @@ PG_VERSION="${PG_VERSION:-unknown}"
 BUILD_MODE="${BUILD_MODE:-client}"
 PREFIX="/tmp/pg-install"
 BUILDDIR="/tmp/pgsrc"
-BUNDLE="${OUT}/postgresql-${PG_VERSION}"
+BUNDLE="${OUT}"
 
 echo "=== Building PostgreSQL ${PG_VERSION} portable bundle (mode: ${BUILD_MODE}) ==="
 

@@ -144,7 +144,7 @@ podman run --rm \
 
 echo ""
 echo "=== Done ==="
-echo "Result: ${OUT_DIR}/postgresql-${VERSION}/"
-ls -la "${OUT_DIR}/postgresql-${VERSION}/"
+echo "Result: ${OUT_DIR}/"
+ls -la "${OUT_DIR}/"
 echo ""
-echo "Run with: ${OUT_DIR}/postgresql-${VERSION}/bin/psql"
+echo "Run with: ${OUT_DIR}/bin/psql"
