@@ -10,10 +10,10 @@ Given a version number, it automatically downloads the official source tarball, 
 ./build.sh 18.4
 ```
 
-This downloads PostgreSQL 18.4, builds it, and produces `output/18.4/postgresql-18.4/`. Then:
+This downloads PostgreSQL 18.4, builds it, and produces `output/18.4/`. Then:
 
 ```bash
-output/18.4/postgresql-18.4/bin/psql -h myhost -U myuser
+output/18.4/bin/psql -h myhost -U myuser
 ```
 
 ## Features
@@ -68,7 +68,7 @@ CACHE_DIR=/tmp/pg-cache ./build.sh 18.4
 ## Output
 
 ```
-output/18.4/postgresql-18.4/
+output/18.4/
 ├── bin/
 │   ├── psql              ← shell wrapper
 │   ├── psql.real         ← real binary
@@ -120,9 +120,8 @@ pg18-portable/
 ├── cache/                # Downloaded tarballs and extracted source
 └── output/
     └── {version}/
-        └── postgresql-{version}/
-            ├── bin/
-            └── lib/
+        ├── bin/
+        └── lib/
 ```
 
 ## License
