@@ -1,34 +1,71 @@
 # pg-portable
 
-Build portable PostgreSQL client tools for any x86_64 Linux system — no installation required.
+Build portable PostgreSQL bundles for any x86_64 Linux system — no installation required.
 
-Given a version number, it automatically downloads the official source tarball, verifies the SHA256 checksum, compiles inside a rootless podman container, and bundles all binaries together with their shared libraries. Copy the output folder anywhere and run.
+Given a version number, it automatically downloads the official source tarball, verifies the SHA256 checksum, compiles inside a container, and bundles the binaries together with everything they load at runtime. Copy the output folder anywhere and run.
+
+Two flavours:
+
+| Command | Output | Contents |
+|---------|--------|----------|
+| `./build.sh 18.4` | `output/18.4/` | Client tools (`psql`, `pg_dump`, …) |
+| `./build.sh 18.4 --full` | `output/18.4-full/` | Client **and** server tools, plus all contrib extensions, the `share/` data tree and the PL interpreter runtimes |
+
+Which program counts as a client or a server tool is the split the upstream
+documentation draws between *PostgreSQL Client Applications* and *PostgreSQL
+Server Applications*: 21 client programs and 14 server programs, plus
+`oid2name` and `vacuumlo` — contrib frontends that are not in either list but
+are libpq clients. The two lists live at the top of `bundle.sh`.
+
+The client half then adds the one helper program its own tools reach across the
+line for: `pg_verifybackup` runs `pg_waldump`. That makes a client bundle 24
+programs instead of 23 — the tools that are in there work, rather than dying
+with "program not found in the same directory as".
+
+The flavours can coexist; they are separate builds with different tool sets and
+different feature sets.
+
+There is no server-only flavour. It would drop 19 client programs and **not one
+shared library** — its `lib/` and `share/` would be byte-identical to `--full`'s
+— for 2.8 MiB, while having to ship `psql`, `pg_dump`,
+`pg_dumpall` and `pg_restore` anyway, for `pg_upgrade`. Passing `--server` fails
+with a pointer to `--full`.
 
 ## Quick start
 
+Client:
+
 ```bash
 ./build.sh 18.4
+output/18.4/bin/psql -h myhost -U myuser
 ```
 
-This downloads PostgreSQL 18.4, builds it, and produces `output/18.4/`. Then:
+Server, with client tools in the same bundle:
 
 ```bash
-output/18.4/bin/psql -h myhost -U myuser
+./build.sh 18.4 --full
+
+cd output/18.4-full
+./bin/initdb -D /path/to/pgdata --locale=C.UTF-8 -U myuser
+./bin/pg_ctl -D /path/to/pgdata -l /tmp/pg.log -o "-p 5433 -k /tmp" start
+./bin/psql -h /tmp -p 5433 -U myuser postgres
+./bin/pg_ctl -D /path/to/pgdata stop -m fast
 ```
 
 ## Features
 
-- **Zero host dependencies** — only podman (rootless) and curl are required
+- **Zero host dependencies** — only podman (rootless) or docker and curl are required to *build*
 - **Auto-download + verify** — fetches from `ftp.postgresql.org` and checks SHA256
 - **Source caching** — downloaded tarballs and extracted sources are reused across builds
-- **Bundled libraries** — every shared library dependency (OpenSSL, Kerberos, LDAP, readline, zstd, …) is included
-- **Cross-distro** — runs on any x86_64 Linux with kernel ≥ 5.x (tested: Debian → Ubuntu)
+- **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, LLVM, readline, zstd, …) is included, plus the glibc the binaries were built against
+- **Bundled interpreter runtimes** (`--full`) — the Python, Perl and Tcl runtimes that PL/Python, PL/Perl and PL/Tcl need
+- **Cross-distro** — runs on any x86_64 Linux with kernel ≥ 5.x (verified: Debian bookworm → Debian bookworm and Rocky Linux 9)
 
 ## Requirements
 
 | Tool  | Minimum version |
 |-------|-----------------|
-| podman (rootless) | 4.x+ |
+| podman (rootless) or docker | 4.x+ / 20.x+ |
 | curl | any |
 | bash | 4.x+ |
 | sha256sum | any (coreutils) |
@@ -42,11 +79,14 @@ output/18.4/bin/psql -h myhost -U myuser
 ### Examples
 
 ```bash
-# Stable release
+# Client bundle (default)
 ./build.sh 18.4
 
+# Client + server bundle, all features enabled
+./build.sh 18.4 --full
+
 # Beta / RC
-./build.sh 19beta1
+./build.sh 19beta1 --full
 
 # Skip download — use previously cached source
 ./build.sh 18.4 --no-download
@@ -62,29 +102,55 @@ CACHE_DIR=/tmp/pg-cache ./build.sh 18.4
 
 | Option | Description |
 |--------|-------------|
+| `--full` | Build the client + server bundle (both tool sets) |
 | `--no-download` | Skip downloading; fail if tarball is not cached |
 | `--cache-dir DIR` | Set cache directory (default: `./cache`) |
+
+The container runtime is chosen automatically: `podman` if present, otherwise
+`docker`. Override with `CONTAINER_RUNTIME=podman|docker`.
 
 ## Output
 
 ```
-output/18.4/
+output/18.4-full/
 ├── bin/
-│   ├── psql              ← shell wrapper
-│   ├── psql.real         ← real binary
-│   ├── pg_dump / .real
-│   ├── pg_restore / .real
-│   └── … (37 tools)
-└── lib/
-    ├── ld-linux-x86-64.so.2   ← bundled dynamic linker
-    ├── libpq.so.5 → libpq.so.5.18
-    ├── libssl.so.3
-    ├── libcrypto.so.3
-    ├── libreadline.so.8
-    └── … (41 libraries)
+│   ├── psql                ← shell wrapper
+│   ├── psql.real           ← real binary
+│   ├── postgres / postgres.real
+│   ├── initdb, pg_ctl, pg_dump, pg_restore, … (37 tools in total)
+├── lib/
+│   ├── ld-linux-x86-64.so.2      ← bundled dynamic linker
+│   ├── libc.so.6, libssl.so.3, libLLVM-14.so.1, libicudata.so.72, …
+│   ├── libnss_files.so.2         ← glibc dlopen()s these, ldd never shows them
+│   ├── libpq.so.5 → libpq.so.5.18
+│   ├── python3.11/               ← CPython standard library
+│   ├── perl/                     ← Perl's @INC trees, mirrored by absolute path
+│   ├── tcl8.6/                   ← Tcl script library
+│   ├── locale/C.utf8/            ← glibc locale data (LOCPATH), not NLS
+│   └── postgresql/               ← loadable modules: plpgsql, plperl, plpython3,
+│                                    pltcl, llvmjit, all contrib extensions
+└── share/
+    ├── postgresql/               ← timezone data, extension SQL, sample configs
+    └── locale/                   ← NLS message catalogues
 ```
 
-The wrapper scripts invoke the real binaries through the bundled `ld-linux`, ensuring the bundled `libc.so.6` and other libraries are used instead of whatever the host system provides.
+Sizes of an 18.4 build: `--full` is around 366 MB, most of it LLVM (104 MB),
+z3 (22 MB), ICU (33 MB) and the interpreter runtimes (110 MB — Python 54, Perl
+53, Tcl 3). The client bundle is around 24 MB: with the server-only features off
+there is no LLVM, no ICU and no interpreter runtime to carry, and nothing below
+`share/` or `lib/postgresql/` is needed by a client tool. `--full` enables every
+optional feature; if size matters more than JIT or PL/Python, those are the
+knobs to turn off in `bundle.sh`.
+
+Every executable is a small `/bin/sh` wrapper that `exec`s the real binary
+through the bundled dynamic linker:
+
+```sh
+exec "$LD_LINUX" --inhibit-cache --library-path "$LIB_DIR" "$REAL_BIN" "$@"
+```
+
+`--inhibit-cache` keeps the loader from reading the host's `/etc/ld.so.cache`,
+so a missing library fails loudly instead of silently picking up a host copy.
 
 ## How it works
 
@@ -94,24 +160,128 @@ The wrapper scripts invoke the real binaries through the bundled `ld-linux`, ens
 2. Downloads `postgresql-{version}.tar.bz2` and its `.sha256` from the official PostgreSQL FTP
 3. Verifies the checksum
 4. Extracts the source (cached for future runs)
-5. Builds the podman image from `Containerfile`
-6. Runs the container with the source (read-only) and output directory mounted
+5. Builds the image from `Containerfile`
+6. Runs the container as the invoking user, with the source (read-only) and output directory mounted
 
-### bundle.sh (inside container)
+### bundle.sh (inside the container)
 
-1. **meson setup** — configures the build with SSL, GSSAPI, LDAP, readline, zstd, LZ4 enabled
-2. **meson compile** — builds the full project (client + server + contrib)
-3. **meson install** — installs to a staging prefix
-4. Copies all binaries to the bundle
-5. Runs `ldd` on every binary, collects all unique shared library paths
-6. Copies those `.so` files to `lib/` (including glibc components and `ld-linux`)
-7. Runs `patchelf --set-rpath '$ORIGIN/../lib'` on every ELF file (except glibc itself and ld-linux)
-8. Creates shell wrappers that launch each binary through the bundled dynamic linker
+1. **meson setup / compile / install** into a staging prefix. The whole tree is
+   compiled in every mode; the mode decides what is shipped. `--full` enables
+   NLS, PL/Perl, PL/Python, PL/Tcl, LLVM, ICU, libxslt, libnuma, liburing,
+   SELinux, systemd and UUID support, and the client build leaves the
+   server-only ones off.
+2. Reads the compiled-in `PGBINDIR`/`PGSHAREDIR`/`PKGLIBDIR`/`LOCALEDIR` out of the
+   generated `pg_config_paths.h` rather than hardcoding them
+3. Copies the programs of the mode's tool set, then runs `ldd` over them to
+   collect shared library dependencies
+4. Adds the libraries `ldd` cannot see: `libpq`/`libecpg`/`libpgtypes` are taken
+   straight out of the install prefix — the build uses `-Drpath=false`, so
+   nothing resolves them and no `ldd` pass ever walks *into* them. Their
+   dependency chain is then collected level by level, because a libpq client is
+   dead without it (`libpq` → `libssl`, `libgssapi_krb5`, `libldap` →
+   `libkrb5`, `libsasl2`, …). Added the same way are the `libnss_*.so.2` modules
+   glibc `dlopen()`s by name and the `.so` files inside the interpreter trees
+5. Copies the server payload (`--full`): loadable modules,
+   `share/postgresql`, `share/locale`, the interpreter runtimes, and the glibc
+   locale data for `C.UTF-8`
+6. `patchelf --set-rpath` on everything except glibc itself, the loader and the NSS
+   modules; rebuilds SONAME symlinks
+7. Replaces each executable with a wrapper script
+8. Asserts that every `DT_NEEDED` entry of every bundled ELF resolves inside the
+   bundle, then writes the launcher wrappers
+
+### Why it is relocatable
+
+PostgreSQL records absolute install paths at build time, but
+`make_relative_path()` (`src/port/path.c`) rewrites them relative to the
+executable's own directory when the last path component matches the compiled-in
+`PGBINDIR` tail — i.e. when the binary lives in a directory named `bin`. Because
+`find_my_exec()` only looks at `argv[0]` and the wrapper `exec`s
+`<bundle>/bin/<name>.real` by absolute path, `share/postgresql`,
+`lib/postgresql` and `share/locale` all resolve inside the bundle.
+
+This makes two things load-bearing:
+
+- **`bin/` must keep its name**, and `bin/`, `lib/`, `share/` must stay siblings.
+- **The build prefix must not contain `pgsql` or `postgres`**, or meson drops the
+  `postgresql` path component and the layout changes. `bundle.sh` aborts if that
+  happens.
+
+## Server notes
+
+- **PostgreSQL refuses to run as root.** `initdb` and `postgres` must run as an
+  ordinary user, and the data directory must be owned by that user.
+- **Pass `--locale=C.UTF-8` to `initdb`.** `--full` carries that locale's data
+  (`lib/locale/C.utf8`) and the launcher points `LOCPATH` at it,
+  but only on a host that has no `/usr/lib/locale/C.utf8` of its own — because
+  setting `LOCPATH` also switches off the `locale-archive` lookup, and a host
+  that ships the locale does not deserve to lose it. Other locales come from the
+  host, so a bare host resolves only `C`, `POSIX` and the bundled `C.UTF-8`.
+- **The default socket directory is `/tmp`** (compiled into PostgreSQL). On a
+  shared machine use `-k` to point at a private directory.
+- **Do not symlink the files in `bin/` elsewhere.** The wrapper resolves its own
+  location and expects `<bundle>/lib` and `<bundle>/share` to be siblings. A
+  symlink *into* the bundle is followed correctly; a copy or a link to somewhere
+  else is not.
+- **PL/Python, PL/Perl and PL/Tcl use the bundled interpreters.** To make that
+  possible, the `postgres` wrapper exports `PYTHONHOME`, `PERL5LIB` and
+  `TCL_LIBRARY`. These are inherited by everything the server forks, so a host
+  interpreter started from `COPY … PROGRAM` or `\!` will see them too. Only the
+  `postgres` wrapper sets them; `psql` and friends do not.
+- **Server-side JIT works, but cross-module inlining does not.** PostgreSQL's
+  meson build does not generate the bitcode tree (`lib/postgresql/bitcode/`) —
+  an upstream TODO. `llvmjit.so` loads, expressions are compiled and optimised;
+  only the inlining step is skipped, which it handles gracefully (DEBUG1 log
+  message). Not a correctness issue.
+
+### Helper programs
+
+Several programs run a helper program found next to them, so a bundle that omits
+the helper ships a tool that cannot work. One such call crosses the client/server
+line, and the client bundle carries the helper for it:
+
+- **`pg_verifybackup`** (client) runs `pg_waldump` (server) to parse the WAL in a
+  backup, so client bundles carry `pg_waldump`. `--no-parse-wal` skips that step.
+
+`pg_upgrade` (server) runs `pg_dumpall`, `pg_dump`, `pg_restore` and `psql`, but
+those are client tools `--full` ships anyway, so nothing is added for it.
+
+Every other sibling lookup stays inside one half: `initdb`, `pg_ctl` and
+`pg_rewind` need `postgres`, `pg_ctl` also needs `initdb`, `pg_createsubscriber`
+needs `pg_ctl` and `pg_resetwal`, and `pg_dumpall` needs `pg_dump`.
+
+### What is *not* self-contained
+
+Some things are host policy by nature, and bundling them would be wrong:
+
+- **`/bin/sh`** — the wrappers are shell scripts. `dirname`, `pwd` and
+  `readlink` are used if present.
+- **`/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`** — identity stays the
+  host's business. The NSS *modules* are bundled, the lookup order is not.
+- **`/etc/hosts`, `/etc/resolv.conf`** — name resolution.
+- **Locale data other than `C.UTF-8`** — the bundle carries the one locale
+  `initdb` needs to run anywhere (see the server notes), and reads the rest from
+  the host, the way a native installation does.
+- **`/etc/ssl/certs`** — trust anchors must be the host's, or they would never
+  be updated.
+- **PAM** — `libpam.so.0` is bundled, but `pam_*.so` modules and `/etc/pam.d/*`
+  are the host's authentication stack. PAM authentication is therefore not
+  portable across distributions.
+- **Kerberos / GSSAPI** — `/etc/krb5.conf` and the GSSAPI mechanism plugins
+  describe *your* realm and are not bundled.
+- **SELinux** — `libselinux.so.1` is bundled, but the policy and
+  `/sys/fs/selinux` belong to the host. `sepgsql` therefore only works where
+  SELinux is enabled and configured.
+
+Building third-party extensions against this bundle is **not supported**: the
+`include/` tree and `lib/postgresql/pgxs/` are not bundled, so `pg_config`
+reports include paths that do not exist. Pure-SQL extensions that ship their own
+`.control` and `.sql` files can still be installed with `CREATE EXTENSION`.
 
 ## Directory structure
 
 ```
-pg18-portable/
+postgresql-portable/
 ├── build.sh              # Entry point: download → verify → build
 ├── bundle.sh             # Container entrypoint: compile → collect → patch → wrap
 ├── Containerfile         # Build environment (Debian Bookworm + TUNA mirror)
@@ -119,9 +289,8 @@ pg18-portable/
 ├── README.md
 ├── cache/                # Downloaded tarballs and extracted source
 └── output/
-    └── {version}/
-        ├── bin/
-        └── lib/
+    ├── {version}/        # client bundle
+    └── {version}-full/   # client + server bundle
 ```
 
 ## License

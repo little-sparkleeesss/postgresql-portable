@@ -40,6 +40,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     tcl-dev \
     gettext \
+    # Server features that meson would otherwise silently disable for lack of
+    # a -dev package (numa-aware shared memory, io_uring AIO, dtrace probes).
+    libnuma-dev \
+    liburing-dev \
+    systemtap-sdt-dev \
+    # tcl-dev only pulls the headers and tclConfig.sh; the tclsh interpreter
+    # comes from tcl8.6 and is what bundle.sh uses to locate the Tcl script
+    # library (/usr/share/tcltk/tcl8.6, shipped by libtcl8.6).
+    tcl8.6 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY bundle.sh /bundle.sh
