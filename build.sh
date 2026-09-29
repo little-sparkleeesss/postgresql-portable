@@ -15,6 +15,18 @@ Modes:
   (default)   client tools      -> output/<version>
   --full      client + server   -> output/<version>-full
 
+Versions:
+  18.4        a release, named exactly as upstream names it
+  18          the newest 18.x, read from the download directory's index
+  19beta1     a beta or release candidate, which upstream does not name <major>.x
+              and therefore has to be given in full
+
+The output directory is named after the version as *asked for*, not as resolved:
+"18" always lands in output/18, which is the point -- a CI job can hardcode the
+path while the release inside it follows upstream. Everything else (the tarball,
+the extracted tree, the version compiled into the bundle) is the concrete
+release, and the run says which one that was.
+
 Which program belongs to which set follows the upstream documentation's split
 between "PostgreSQL Client Applications" and "PostgreSQL Server Applications";
 both lists live at the top of bundle.sh.
@@ -48,6 +60,7 @@ Host build:
 
 Examples:
   $0 18.4                 client bundle          -> output/18.4
+  $0 18                   newest 18.x            -> output/18
   $0 18.4 --full          client + server bundle -> output/18.4-full
   $0 19beta1 --full       build PG 19 beta 1 (all features enabled)
   $0 18.4 --no-download   skip download, use existing cache
@@ -628,6 +641,85 @@ if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     provision_host_deps
 fi
 
+# =====================================================================
+# Major-only version: "18" means the newest 18.x
+# =====================================================================
+#
+# The answer comes from the download directory's own index -- the listing the
+# tarball is fetched from -- rather than from anywhere else, so what it names
+# can actually be downloaded. Two things about that index shape the code
+# below. It is not dense -- numbers get skipped when a release is withdrawn
+# (the FTP has a v18.6 and no v18.5) -- so the newest is the highest one
+# present, never "the previous plus one". And it lists betas and release
+# candidates under names that are not <major>.<digits> (v19beta1, v18rc2), which
+# is what the [0-9]+ after the dot is for: asking for 18 must not answer with
+# 18rc2, and asking for 19 must not answer with 19beta1.
+#
+# Sort with -V, not the default: "18.9" sorts above "18.10" lexically.
+
+resolve_major_version() {   # <major> -> a release version on stdout
+    local major="$1" version listing
+    if [[ "${SKIP_DOWNLOAD}" = true ]]; then
+        # --no-download keeps the network out of it, so the answer has to come
+        # from what is already here: the highest 18.x tarball in the cache.
+        version="$(
+            find "${CACHE_DIR}" -maxdepth 1 -name "postgresql-${major}.*.tar.bz2" \
+                -printf '%f\n' 2>/dev/null \
+                | sed -nE "s/^postgresql-(${major}\.[0-9]+)\.tar\.bz2$/\1/p" \
+                | sort -V | tail -n 1
+        )" || true
+        if [[ -z "${version}" ]]; then
+            echo "ERROR: '${major}' cannot be resolved without the network, and" >&2
+            echo "       --no-download rules it out. ${CACHE_DIR} holds no" >&2
+            echo "       postgresql-${major}.<minor>.tar.bz2 tarball. Name the" >&2
+            echo "       release in full (e.g. ${major}.0), or drop --no-download." >&2
+            exit 1
+        fi
+    else
+        # Keep "the index could not be read" apart from "the index has no such
+        # release": they need different fixes, and reporting the second when the
+        # first happened sends the reader looking for a version that is there.
+        if ! listing="$(curl -fsSL --max-time 60 "${PG_FTP_BASE}/" 2>/dev/null)"; then
+            echo "ERROR: could not read the release index at ${PG_FTP_BASE}/" >&2
+            echo "       (network or proxy problem). Name the release in full," >&2
+            echo "       e.g. ${major}.0, to build without the lookup." >&2
+            exit 1
+        fi
+        version="$(
+            printf '%s\n' "${listing}" \
+                | sed -nE "s/.*href=\"v(${major}\.[0-9]+)\/.*/\1/p" \
+                | sort -V | tail -n 1
+        )" || true
+        if [[ -z "${version}" ]]; then
+            echo "ERROR: no released ${major}.x under ${PG_FTP_BASE}/" >&2
+            echo "       Beta and release-candidate directories are not named" >&2
+            echo "       ${major}.x; pass one in full if that is what you want," >&2
+            echo "       e.g. ${major}beta1." >&2
+            exit 1
+        fi
+    fi
+    printf '%s' "${version}"
+}
+
+# What was asked for names the output directory; what it resolves to names
+# everything that gets downloaded. The two are the same unless the request was
+# a bare major, which is exactly when a caller wants the path to stay put.
+REQ_VERSION="${VERSION}"
+
+if [[ "${VERSION}" =~ ^[0-9]+$ ]]; then
+    RESOLVED="$(resolve_major_version "${VERSION}")"
+    # Say which question was answered. Offline it is "the newest one here", which
+    # is not the same claim as "the newest one there", and printing the second
+    # when the first was meant would read as an endorsement of a stale release.
+    if [[ "${SKIP_DOWNLOAD}" = true ]]; then
+        echo "Version '${VERSION}' names a major release: using the newest in the cache, ${RESOLVED}"
+        echo "  (--no-download: a newer ${VERSION}.x may exist upstream)"
+    else
+        echo "Version '${VERSION}' names a major release: using the newest ${VERSION}.x, ${RESOLVED}"
+    fi
+    VERSION="${RESOLVED}"
+fi
+
 # -- determine source directory ---------------------------------------
 # If VERSION is a local path (starts with / or ./)
 if [[ "${VERSION}" =~ ^(/|\./) && -d "${VERSION}" ]]; then
@@ -720,7 +812,7 @@ case "${BUILD_MODE}" in
     client) OUT_SUFFIX="";      MODE_DESC="client tools only" ;;
     full)   OUT_SUFFIX="-full"; MODE_DESC="client + server tools" ;;
 esac
-OUT_DIR="${SCRIPT_DIR}/output/${VERSION}${OUT_SUFFIX}"
+OUT_DIR="${SCRIPT_DIR}/output/${REQ_VERSION}${OUT_SUFFIX}"
 
 if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     echo ""
@@ -766,6 +858,11 @@ fi
 
 echo ""
 echo "=== Done ==="
+# The directory is named for the request, so say what actually went into it --
+# otherwise "output/18/" is the only thing a log records about the release.
+if [[ "${REQ_VERSION}" != "${VERSION}" ]]; then
+    echo "'${REQ_VERSION}' resolved to PostgreSQL ${VERSION}"
+fi
 echo "Result: ${OUT_DIR}/"
 ls -la "${OUT_DIR}/"
 echo ""

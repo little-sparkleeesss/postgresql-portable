@@ -88,6 +88,9 @@ Kerberos, LDAP, ICU, LLVM, …) is installed on the host instead, through apt
 # Client bundle (default)
 ./build.sh 18.4
 
+# Newest 18.x, whatever that is today — always lands in output/18/
+./build.sh 18
+
 # Client + server bundle, all features enabled
 ./build.sh 18.4 --full
 
@@ -106,6 +109,37 @@ CACHE_DIR=/tmp/pg-cache ./build.sh 18.4
 # Build on this machine, installing whatever the toolchain is missing
 ./build.sh 18.4 --full --without-container
 ```
+
+### Versions
+
+`<version>` is one of three things:
+
+| Form | Meaning |
+|------|---------|
+| `18.4` | That release, named exactly as upstream names it |
+| `18` | The newest `18.x`, resolved at build time |
+| `19beta1` | A beta or release candidate, which upstream does not name `<major>.x` and so has to be spelled out |
+
+`18` is resolved against the directory index the tarball itself comes from, so
+whatever it names can actually be downloaded.
+
+**The output directory is named after the version as asked for, not as
+resolved.** `./build.sh 18` always produces `output/18/` — `output/18-full/` with
+`--full` — so a CI job can hardcode the path while the release inside it follows
+upstream. The tarball, the extracted tree and the version compiled into the
+bundle are all the concrete release, and the build reports which one that was.
+A version given in full resolves to itself, so `./build.sh 18.6` still produces
+`output/18.6/`, and nothing changes for it.
+
+Two details of that index shape the result. It is not dense — numbers get
+skipped when a release is withdrawn, so `18.5` may never exist while `18.6`
+does — which is why the answer is the highest one listed and never "the
+previous plus one". And the entries are compared with `sort -V`, because a
+plain sort puts `17.9` above `17.11`.
+
+With `--no-download` there is no index to read, so `18` means the newest `18.x`
+**in the cache**, and the build says so: that choice can be older than what
+upstream has.
 
 ### Options
 
