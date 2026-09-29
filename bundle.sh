@@ -1186,6 +1186,58 @@ if [[ "${WITH_SERVER}" = true ]]; then
     prune_links "${BUNDLE}/lib/perl"
     prune_links "${BUNDLE}/lib/${TCL_VER}"
 
+    # -- Drop what only a compiler wants ----------------------------------
+    # The trees above are copied whole, because that is what makes them work:
+    # CPython's standard library is a directory, and Perl's @INC entries are
+    # directories. But "the standard library directory" is not the same thing
+    # as "what the interpreter reads at run time", and what does not belong is
+    # consistently the part that exists for building *against* the interpreter:
+    #
+    #   <stdlib>/config-<...>/   the Makefile, config.c, python.o and both
+    #                            static libpython archives -- 25 MB, of which
+    #                            23.9 MB is the archives. Nothing at run time
+    #                            links a static library; the interpreter loads
+    #                            libpython3.11.so.1.0, which is in lib/.
+    #   perl/.../CORE/           81 C headers, 7.9 MB, for compiling XS
+    #                            modules. plperl does not compile anything.
+    #
+    # Dropping them costs the ability to build against the bundled interpreter
+    # on the target machine -- which is the same thing this bundle already does
+    # not support for PostgreSQL itself, having no include/ and no pgxs.
+    prune_build_only() {
+        local f d before after freed
+        before="$(du -sk "${BUNDLE}" | cut -f1)"
+
+        # Every static library, not only the two known ones: nothing in a
+        # running bundle links one, and a recipe could install more.
+        while IFS= read -r f; do
+            [[ -n "${f}" ]] || continue
+            rm -f -- "${f}"
+        done < <(find "${BUNDLE}" -type f -name '*.a' -print 2>/dev/null)
+
+        # By find rather than by path: where the build tree sits inside the
+        # standard library, and how deep Perl's @INC entry is, are both the
+        # distribution's business (Debian nests one level under the tuple,
+        # Fedora does not).
+        while IFS= read -r d; do
+            [[ -n "${d}" ]] || continue
+            rm -rf -- "${d}"
+        done < <(find "${BUNDLE}/${PY_LIBDIR}/python${PY_VER}" -maxdepth 1 \
+                     -type d -name 'config-*' -print 2>/dev/null)
+        while IFS= read -r d; do
+            [[ -n "${d}" ]] || continue
+            rm -rf -- "${d}"
+        done < <(find "${BUNDLE}/lib/perl" -type d -name 'CORE' -print 2>/dev/null)
+
+        after="$(du -sk "${BUNDLE}" | cut -f1)"
+        freed=$((before - after))
+        if [[ "${freed}" -gt 0 ]]; then
+            printf '  dropped %s MB only a compiler wants (static libs, python config-*/, perl CORE/)\n' \
+                "$((freed / 1024))"
+        fi
+    }
+    prune_build_only
+
     # The .so files inside these trees link against libssl, libcrypt, ... and
     # are outside every earlier scan.
     echo "  collecting dependencies of bundled interpreter modules"

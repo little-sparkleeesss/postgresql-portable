@@ -380,17 +380,22 @@ The interpreter tree sits where its own interpreter looks for it: Python built
 with `platlibdir=lib64` (Fedora, RHEL) finds its standard library under
 `lib64/python3.11/`, so a bundle built there keeps that name rather than `lib/`.
 
-Sizes of an 18.4 build: `--full` is around 243 MB — the interpreter runtimes
-(110 MB: Python 54, Perl 53, Tcl 3), ICU (37 MB), and the PostgreSQL payload
-itself (`bin/` 17 MB, `share/` 29 MB, `lib/postgresql/` 7 MB). The client bundle
-is around 24 MB: with the server-only features off there is no ICU and no
-interpreter runtime to carry, and nothing below `share/` or `lib/postgresql/` is
-needed by a client tool. `--full` enables every optional feature except JIT; if
-size matters more than ICU or PL/Python, those are the knobs to turn off in
-`bundle.sh`.
+Sizes of an 18.4 build: `--full` is around 211 MB — the interpreter runtimes
+(77 MB: Python 29, Perl 45, Tcl 3), ICU (37 MB), the rest of the shared
+libraries (45 MB: libcrypto, libssl, libstdc++, libgnutls, libkrb5, …), and
+the PostgreSQL payload itself (`bin/` 17 MB, `share/` 29 MB,
+`lib/postgresql/` 7 MB). The client bundle is around 24 MB: with the server-only
+features off there is no ICU and no interpreter runtime to carry, and nothing
+below `share/` or `lib/postgresql/` is needed by a client tool. `--full` enables
+every optional feature except JIT; if size matters more than ICU or PL/Python,
+those are the knobs to turn off in `bundle.sh`.
 
-**LLVM and z3 are gone** — 127 MB, a third of what `--full` used to be — because
-JIT is not built. See the server notes for why.
+Two things that were in that number are gone on purpose, and both were large.
+**LLVM and z3** — 127 MB, a third of what `--full` used to be — because JIT is
+not built; the server notes say why. And **the interpreters are trimmed to what
+runs**: CPython's `config-*/` directory with its two static `libpython`
+archives, and Perl's `CORE/` headers, are 32 MB of files that exist for
+building *against* an interpreter. Nothing at run time reads them.
 
 `--locales` adds to whatever was built: about 0.4–3 MB per locale, or roughly
 230 MB for `all`, which is most of a bundle's worth again. The build image is
@@ -452,8 +457,10 @@ so a missing library fails loudly instead of silently picking up a host copy.
    glibc `dlopen()`s by name and the `.so` files inside the interpreter trees
 6. Copies the server payload (`--full`): loadable modules, `share/postgresql`,
    `share/locale`, the interpreter runtimes, the locales `--locales` asked for,
-   and the glibc locale data for `C.UTF-8`. An extension installed into those
-   same two trees in step 3, so it comes along here
+   and the glibc locale data for `C.UTF-8` — and then drops from those
+   interpreter trees the 32 MB that only a compiler wants (any `*.a`, CPython's
+   `config-*/`, Perl's `CORE/`). An extension installed into those same two
+   trees in step 3, so it comes along here
 7. `patchelf --set-rpath` on everything except glibc itself, the loader and the NSS
    modules; rebuilds SONAME symlinks
 8. Replaces each executable with a wrapper script
