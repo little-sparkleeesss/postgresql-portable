@@ -279,7 +279,26 @@ else
             -Dplpython=enabled
             -Dpltcl=enabled
             -Ddtrace=auto
-            -Dllvm=enabled
+            # JIT is off, and "disabled" rather than "auto" on purpose: auto
+            # would find the image's llvm-dev and turn it back on.
+            #
+            # llvmjit.so exists for one thing -- compiling expressions of
+            # queries expensive enough to pass jit_above_cost, which defaults
+            # to 100000 -- and it costs 127 MB, a third of what the bundle
+            # would be with it: libLLVM is 105 MB and libz3 is a NEEDED of it.
+            # A distribution's own PostgreSQL build pays the same 124 MB
+            # (LLVM 19), but it pays it for a server that is meant to run real
+            # analytical loads; a bundle that gets copied to a machine and run
+            # from a directory is not that. The JIT it would get is a partial
+            # one anyway: the meson build emits no bitcode for its own modules,
+            # so cross-module inlining never happens (upstream TODO).
+            #
+            # What is lost is speed on expensive queries, not correctness:
+            # without a provider, expressions are interpreted, which is what
+            # every PostgreSQL before 11 did. What that saves is a third of the
+            # size, and it takes libLLVM out of a bundle whose whole point is
+            # not needing anything from the machine it lands on.
+            -Dllvm=disabled
             -Dselinux=enabled
             -Dsystemd=enabled
             -Dicu=enabled

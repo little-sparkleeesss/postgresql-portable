@@ -33,9 +33,12 @@ both lists live at the top of bundle.sh.
 
 --full builds the complete server payload: the extension modules, the share/
 data trees and the Python / Perl / Tcl runtimes that PL/Python, PL/Perl and
-PL/Tcl need, with every server-side feature enabled. Every bundle is
-self-contained, with its own dynamic linker and shared libraries. The client
-build leaves the server-only features off, which is what keeps it small.
+PL/Tcl need, with every server-side feature enabled except JIT, which is left
+out on purpose (see the note in bundle.sh: 127 MB for a feature that only pays
+off on queries expensive enough that nobody runs them from a portable bundle).
+Every bundle is self-contained, with its own dynamic linker and shared
+libraries. The client build leaves the server-only features off, which is what
+keeps it small.
 
 There is no server-only mode. It would drop 19 client programs and nothing
 else -- not a single shared library -- for 2.8 MiB, and it could not even
@@ -76,7 +79,7 @@ Extensions:
                        against the prefix this build installed, in the same
                        image as the server, which is what lets the ordinary
                        copy and dependency walk take it in: a module linked
-                       against the same glibc, OpenSSL and LLVM as the binaries
+                       against the same glibc and OpenSSL as the binaries
                        beside it needs no machinery of its own.
                        A recipe's own dependencies (EXT_DEPS) are probed: in
                        the build image they are the Containerfile's business,
@@ -430,7 +433,7 @@ fi
 #          locales  - only when --locales named something other than "all"
 #          locales-all - only with --locales=all
 #          A row is used when any of its modes is active. A client build
-#          therefore never pulls in LLVM or the interpreter runtimes.
+#          therefore never pulls in the interpreter runtimes.
 #
 #          The two locale modes are separate because the capability is not the
 #          same one: a machine with one langpack can serve a named locale but
@@ -473,8 +476,6 @@ libcurl     | all         | lib:libcurl:curl/curl.h                | pkgconfig(l
 xml2        | all         | lib:libxml-2.0:libxml2/libxml/parser.h | pkgconfig(libxml-2.0)                                                  | libxml2-dev
 icu         | server      | lib:icu-uc,icu-i18n:unicode/utypes.h   | pkgconfig(icu-uc)                                                      | libicu-dev
 xslt        | server      | lib:libxslt:libxslt/xslt.h             | pkgconfig(libxslt)                                                     | libxslt1-dev
-llvm        | server      | cmd:llvm-config                        | /usr/bin/llvm-config                                                   | llvm-dev
-clang       | server      | cmd:clang                              | /usr/bin/clang                                                         | clang
 systemd     | server      | lib:libsystemd:systemd/sd-daemon.h     | pkgconfig(libsystemd)                                                  | libsystemd-dev
 selinux     | server      | lib:libselinux:selinux/selinux.h       | pkgconfig(libselinux)                                                  | libselinux1-dev
 uuid        | server      | lib:uuid:uuid/uuid.h                   | pkgconfig(uuid)                                                        | uuid-dev libuuid1-dev

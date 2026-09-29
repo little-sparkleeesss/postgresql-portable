@@ -27,12 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     # for ldd, strip, etc
     binutils \
-    # Full-mode extras (server features, PL languages, ICU, XML, LLVM, etc.)
+    # Full-mode extras (server features, PL languages, ICU, XML, etc.).
+    # llvm-dev and clang are deliberately absent: they are the only way to
+    # build llvmjit.so, and it is not built -- see the note in bundle.sh. Not
+    # installing them also keeps libLLVM and libz3 out of this image, which is
+    # 127 MB that would otherwise be sitting here for a feature nothing uses.
     libicu-dev \
     libxml2-dev \
     libxslt1-dev \
-    llvm-dev \
-    clang \
     libsystemd-dev \
     libselinux1-dev \
     uuid-dev \

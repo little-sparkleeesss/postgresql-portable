@@ -57,7 +57,7 @@ cd output/18.4-full
 - **Zero host dependencies** — only podman (rootless) or docker and curl are required to *build*
 - **Auto-download + verify** — fetches from `ftp.postgresql.org` and checks SHA256
 - **Source caching** — downloaded tarballs and extracted sources are reused across builds
-- **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, LLVM, readline, zstd, …) is included, plus the glibc the binaries were built against
+- **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, readline, zstd, …) is included, plus the glibc the binaries were built against
 - **Bundled interpreter runtimes** (`--full`) — the Python, Perl and Tcl runtimes that PL/Python, PL/Perl and PL/Tcl need
 - **Selectable locales** (`--locales`) — carry the glibc locale data for the languages you need, so `initdb --locale=zh_CN.UTF-8` works on a host that has no locales of its own
 - **Extensions built from source** (`--extension`) — a recipe of your own, compiled against the server's own prefix in the same image, so the module and its libraries go through the ordinary copy and `ldd` walk
@@ -75,7 +75,7 @@ cd output/18.4-full
 
 With `--without-container` no container runtime is needed; the build toolchain
 (gcc, meson, ninja, bison, flex, patchelf, the `-dev` packages of OpenSSL,
-Kerberos, LDAP, ICU, LLVM, …) is installed on the host instead, through apt
+Kerberos, LDAP, ICU, …) is installed on the host instead, through apt
 (Debian, Ubuntu) or dnf (Fedora, RHEL, Rocky).
 
 ## Usage
@@ -254,7 +254,7 @@ recipe declares, the environment `ext_build` is given, the dependency probes,
 and what a recipe may not do.
 
 **Why build rather than import.** A compiled extension is linked against the
-same glibc, the same OpenSSL and the same LLVM as the binaries beside it. An
+same glibc and the same OpenSSL as the binaries beside it. An
 extension absorbed from a distribution's archive is not — it was built on
 somebody else's base — and *that* is what needed a verification apparatus per
 package: is its glibc new enough, does every library it loads resolve from the
@@ -359,7 +359,7 @@ output/18.4-full/
 │   ├── initdb, pg_ctl, pg_dump, pg_restore, … (37 tools in total)
 ├── lib/
 │   ├── ld-linux-x86-64.so.2      ← bundled dynamic linker
-│   ├── libc.so.6, libssl.so.3, libLLVM-14.so.1, libicudata.so.72, …
+│   ├── libc.so.6, libssl.so.3, libicudata.so.72, libzstd.so.1, …
 │   ├── libnss_files.so.2         ← glibc dlopen()s these, ldd never shows them
 │   ├── libpq.so.5 → libpq.so.5.18
 │   ├── python3.11/               ← CPython standard library
@@ -369,7 +369,7 @@ output/18.4-full/
 │   ├── locale/zh_CN.utf8/        ← …and any others --locales asked for,
 │   │                                under the folded name glibc looks up
 │   └── postgresql/               ← loadable modules: plpgsql, plperl, plpython3,
-│                                    pltcl, llvmjit, all contrib extensions,
+│                                    pltcl, all contrib extensions,
 │                                    plus any --extension brought (myext.so, …)
 └── share/
     ├── postgresql/               ← timezone data, extension SQL, sample configs
@@ -380,16 +380,22 @@ The interpreter tree sits where its own interpreter looks for it: Python built
 with `platlibdir=lib64` (Fedora, RHEL) finds its standard library under
 `lib64/python3.11/`, so a bundle built there keeps that name rather than `lib/`.
 
-Sizes of an 18.4 build: `--full` is around 366 MB, most of it LLVM (104 MB),
-z3 (22 MB), ICU (33 MB) and the interpreter runtimes (110 MB — Python 54, Perl
-53, Tcl 3). The client bundle is around 24 MB: with the server-only features off
-there is no LLVM, no ICU and no interpreter runtime to carry, and nothing below
-`share/` or `lib/postgresql/` is needed by a client tool. `--full` enables every
-optional feature; if size matters more than JIT or PL/Python, those are the
-knobs to turn off in `bundle.sh`. `--locales` adds to whatever was built: about
-1–3 MB per locale, or roughly 230 MB for `all`, which is most of a bundle's worth
-again. The build image grows by about 220 MB either way, since it holds the data
-the bundles are cut from.
+Sizes of an 18.4 build: `--full` is around 243 MB — the interpreter runtimes
+(110 MB: Python 54, Perl 53, Tcl 3), ICU (37 MB), and the PostgreSQL payload
+itself (`bin/` 17 MB, `share/` 29 MB, `lib/postgresql/` 7 MB). The client bundle
+is around 24 MB: with the server-only features off there is no ICU and no
+interpreter runtime to carry, and nothing below `share/` or `lib/postgresql/` is
+needed by a client tool. `--full` enables every optional feature except JIT; if
+size matters more than ICU or PL/Python, those are the knobs to turn off in
+`bundle.sh`.
+
+**LLVM and z3 are gone** — 127 MB, a third of what `--full` used to be — because
+JIT is not built. See the server notes for why.
+
+`--locales` adds to whatever was built: about 0.4–3 MB per locale, or roughly
+230 MB for `all`, which is most of a bundle's worth again. The build image is
+about 1.2 GB, since it holds the toolchain and the data the bundles are cut
+from.
 
 Every executable is a small `/bin/sh` wrapper that `exec`s the real binary
 through the bundled dynamic linker:
@@ -423,7 +429,7 @@ so a missing library fails loudly instead of silently picking up a host copy.
 
 1. **meson setup / compile / install** into a staging prefix. The whole tree is
    compiled in every mode; the mode decides what is shipped. `--full` enables
-   NLS, PL/Perl, PL/Python, PL/Tcl, LLVM, ICU, libxslt, libnuma, liburing,
+   NLS, PL/Perl, PL/Python, PL/Tcl, ICU, libxslt, libnuma, liburing,
    SELinux, systemd and UUID support, and the client build leaves the
    server-only ones off.
 2. Reads the compiled-in `PGBINDIR`/`PGSHAREDIR`/`PKGLIBDIR`/`LOCALEDIR` out of the
@@ -506,11 +512,16 @@ This makes two things load-bearing:
   `TCL_LIBRARY`. These are inherited by everything the server forks, so a host
   interpreter started from `COPY … PROGRAM` or `\!` will see them too. Only the
   `postgres` wrapper sets them; `psql` and friends do not.
-- **Server-side JIT works, but cross-module inlining does not.** PostgreSQL's
-  meson build does not generate the bitcode tree (`lib/postgresql/bitcode/`) —
-  an upstream TODO. `llvmjit.so` loads, expressions are compiled and optimised;
-  only the inlining step is skipped, which it handles gracefully (DEBUG1 log
-  message). Not a correctness issue.
+- **There is no JIT.** The bundle is built without LLVM — no `llvmjit.so`, no
+  `lib/postgresql/bitcode/` — which saves 127 MB (`libLLVM` is 105 MB of it)
+  and costs speed on queries expensive enough to pass `jit_above_cost`.
+  Expressions are interpreted instead: what every PostgreSQL before 11 did,
+  with no difference in correctness. To put it back, `-Dllvm=enabled` in
+  `bundle.sh` and `llvm-dev` + `clang` in the `Containerfile`.
+- **Nothing in the bundle is bitcode.** Worth saying because an extension
+  built from a recipe *would* emit it — PGXS does that when `pg_config
+  --configure` says `--with-llvm` — and this one does not, so there is nothing
+  under `lib/postgresql/bitcode/` at all.
 
 ### Helper programs
 

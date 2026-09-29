@@ -126,8 +126,8 @@ VERIFY_EXTENSIONS=<control name> ./verify.sh output/18.4-full
 4. `VERIFY_EXTENSIONS=<control name> ./verify.sh output/18.4-full`
 
 Two things are worth knowing about the result. The extension is compiled by
-the same image as the server, so it is linked against the same glibc, OpenSSL
-and LLVM — that is what makes it an ordinary part of the bundle rather than
+the same image as the server, so it is linked against the same glibc and the
+same OpenSSL — that is what makes it an ordinary part of the bundle rather than
 something that has to be checked for compatibility. And `PG_MODULE_MAGIC`
 means a build for the wrong major fails at load time and nowhere earlier:
 nothing in a recipe checks that the version it pins still supports the server
