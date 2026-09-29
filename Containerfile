@@ -61,6 +61,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     locales-all \
     && rm -rf /var/lib/apt/lists/*
 
+# -- A recipe's build dependencies --------------------------------------
+# Nothing is installed from the network while this image runs, and no
+# repository is configured in it: an extension's source is fetched by build.sh
+# on the host, and what happens in here is a compile. That makes this list the
+# one place a recipe's own dependencies can come from, so a recipe that asks
+# for something (EXT_DEPS -- see extensions/README.md) wants the package that
+# provides it added above, beside the core's. bundle.sh says so by name when it
+# finds one missing, which is the only hint it can give: it knows the
+# capability, not the package.
+
 COPY bundle.sh /bundle.sh
 RUN chmod +x /bundle.sh
 

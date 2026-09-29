@@ -6,12 +6,24 @@ OUT="${OUT:-/out}"
 PG_VERSION="${PG_VERSION:-unknown}"
 BUILD_MODE="${BUILD_MODE:-client}"
 LOCALES="${LOCALES:-}"
+# Extensions to build from source, newline separated: one directory per
+# extension, each holding the recipe (a shell file, see extensions/README.md)
+# and the source tarball that recipe names. build.sh does the fetching -- the
+# host is where the cache and the checksum live, and where the PostgreSQL
+# tarball is fetched too -- so nothing here reaches the network. It hands over
+# the real paths on a host build and generated mount points inside the
+# container, so this script sees one shape either way.
+EXT_SPECS="${EXT_SPECS:-}"
 # Locales actually copied into the bundle, as opposed to the ones asked for.
 # The launcher's behaviour is decided by this list and not by LOCALES: the
 # request can name a locale the build could not find, and a client build never
 # copies any, yet neither case should produce a launcher that points LOCPATH at
 # a directory which is not there.
 bundled_locales=()
+# The extensions the recipes actually brought, by the name their control file
+# gives -- which is what CREATE EXTENSION takes, and not always the recipe's own
+# name. Filled in by build_extensions, reported at the end of the build.
+ext_installed=()
 PREFIX="/tmp/pg-install"
 BUILDDIR="/tmp/pgsrc"
 BUNDLE="${OUT}"
@@ -79,7 +91,114 @@ if [[ -n "${LOCALES}" && "${WITH_SERVER}" = false ]]; then
     exit 1
 fi
 
+ext_specs=()
+if [[ -n "${EXT_SPECS}" ]]; then
+    while IFS= read -r ext_line; do
+        [[ -n "${ext_line}" ]] || continue
+        ext_specs+=("${ext_line}")
+    done <<<"${EXT_SPECS}"
+fi
+
+# Same reasoning as the LOCALES guard above: the image entrypoint can be run
+# without build.sh, so this copy has to refuse the combination on its own.
+if [[ ${#ext_specs[@]} -gt 0 && "${WITH_SERVER}" = false ]]; then
+    echo "ERROR: EXT_SPECS is set but this is a client build. An extension is" >&2
+    echo "       server payload: its module goes to lib/postgresql/ and its" >&2
+    echo "       .control and .sql to share/postgresql/extension/, and a client" >&2
+    echo "       bundle has neither. Build with BUILD_MODE=full." >&2
+    exit 1
+fi
+
 echo "=== Building PostgreSQL ${PG_VERSION} portable bundle (${BUILD_MODE}: ${MODE_DESC}) ==="
+
+# -- SONAME links, rebuilt from what the files say -----------------------
+# Every *.so.<version> in lib/ gets the *.so.<soname> link named after it, read
+# out of the file rather than remembered from a list.
+#
+# This is a function called at two points rather than a step that runs once,
+# and the reason is ordering:
+#
+#   * It has to have run before the dependency walk, because the walk decides
+#     what to copy by asking what the bundle already has. libpq is the one that
+#     bites: the install prefix supplies libpq.so.5.18 and the .so.5 link is
+#     made here, so a walk that ran first concludes libpq.so.5 is missing and
+#     copies Debian's on top of the one this build just compiled. It is only
+#     luck that the later link pass then points .so.5 back at the right file --
+#     the wrong library was briefly in the bundle and the walk's answer was
+#     wrong.
+#   * It has to run again afterwards, or a library the walk copied in has no
+#     link of its own.
+#
+# readelf rather than "patchelf --print-soname": the soname is one field of the
+# dynamic section, and taking it from binutils means the links still get built
+# on a host that has no patchelf.
+rebuild_soname_links() {
+    local f soname
+    shopt -s nullglob
+    for f in "${BUNDLE}/lib/"*.so.*; do
+        [[ -f "${f}" && ! -L "${f}" ]] || continue
+        soname="$(readelf -d -- "${f}" 2>/dev/null \
+            | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p' | head -n 1)"
+        [[ -n "${soname}" ]] || continue
+        [[ "${soname}" = "$(basename "${f}")" ]] && continue
+        ln -sf "$(basename "${f}")" "${BUNDLE}/lib/${soname}"
+    done
+    shopt -u nullglob
+}
+
+# -- One build per output directory -------------------------------------
+# The bundle is emptied and refilled, so two builds aimed at the same output
+# directory race: the second wipes what the first has already written, both
+# carry on, and what is left is a half-written bundle whose symptoms -- a
+# wrapper with no .real beside it, a library that never arrived -- read like a
+# broken build rather than like two. That is not hypothetical; it is how this
+# check came to be written.
+#
+# The lock file lives inside the bundle rather than beside it because that is
+# the only path the two sides share: /out is a bind mount, so a process in
+# another container -- or on the host, under --without-container -- contends on
+# the same inode. It is taken before the compile, so a second build fails in
+# the first second instead of fifteen minutes in.
+#
+# flock is not everywhere, so a lock directory stands in for it. That one does
+# go stale when a build is killed outright, which is why the pid goes inside.
+# fd 9 rather than {var}>: the latter needs bash 4.1, and this script only
+# promises 4.x.
+OUT_LOCK_MODE=""
+if command -v flock >/dev/null 2>&1; then
+    OUT_LOCK_MODE="flock"
+    exec 9>"${BUNDLE}/.pg-portable.lock"
+    if ! flock -n 9; then
+        echo "ERROR: another build is already writing ${BUNDLE}." >&2
+        echo "       It holds the lock on ${BUNDLE}/.pg-portable.lock." >&2
+        echo "       Wait for it to finish, or stop it, before starting another." >&2
+        exit 1
+    fi
+else
+    OUT_LOCK_MODE="dir"
+    if ! mkdir "${BUNDLE}/.pg-portable.lock.d" 2>/dev/null; then
+        echo "ERROR: another build is already writing ${BUNDLE}." >&2
+        if [[ -f "${BUNDLE}/.pg-portable.lock.d/pid" ]]; then
+            echo "       It recorded pid $(cat "${BUNDLE}/.pg-portable.lock.d/pid")." >&2
+        fi
+        echo "       If nothing is building, that lock is stale: remove" >&2
+        echo "       ${BUNDLE}/.pg-portable.lock.d and try again." >&2
+        exit 1
+    fi
+    printf '%s\n' "$$" > "${BUNDLE}/.pg-portable.lock.d/pid"
+fi
+
+# Remove the lock when this build is done with it, however it ends. The
+# directory form has to; the file form only keeps things tidy -- the kernel
+# drops an flock when the process dies regardless.
+drop_out_lock() {
+    if [[ "${OUT_LOCK_MODE}" = "flock" ]]; then
+        rm -f "${BUNDLE}/.pg-portable.lock"
+    else
+        rm -rf "${BUNDLE}/.pg-portable.lock.d"
+    fi
+}
+trap drop_out_lock EXIT
 
 # -- Explain a meson failure (host builds) ------------------------------
 # meson stops at the first thing it cannot find. In a container build the fix
@@ -246,6 +365,293 @@ echo "  localedir:${PG_LOCALEDIR}"
 echo "=== Installed binaries ==="
 ls -la "${PREFIX}/bin/"
 
+# -- Extensions, built from source (--extension) ------------------------
+# An extension is compiled the way the server itself is: from source, against
+# the prefix just installed, in this same image. That is the point of building
+# it here rather than absorbing a package someone else built -- what comes out
+# is linked against the same libc and the same OpenSSL as the binaries beside
+# it, so Steps 11b and 11c take it in with no machinery of their own and
+# nothing about its provenance to verify.
+#
+# A recipe is a shell file holding what you would type on a host: where the
+# source comes from, what it needs, and the commands to build it. It is
+# *sourced* rather than executed, so ext_build() sees this shell's variables
+# and functions, and this script decides when it runs.
+#
+# Where it runs is load-bearing: after the install above and before Step 4, so
+# that Step 11b's `cp -r ${PG_PKGLIBDIR}/*` and Step 11c's rpath patch and ldd
+# pass take the new module in with everything else. Installing into ${BUNDLE}
+# directly would bypass all three, plus the SONAME rebuild in Step 10 and the
+# assertion in Step 12b.
+recipe_has_cmd() {   # cmd:a,b -> any of those commands in PATH
+    local n
+    for n in ${1//,/ }; do
+        command -v "${n}" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+recipe_has_hdr() {   # hdr:a/b.h,c/d.h -> first hit under the include roots
+    local p root
+    for p in ${1//,/ }; do
+        for root in /usr/include /usr/local/include /usr/include/*/; do
+            [[ -f "${root}/${p}" ]] && return 0
+        done
+    done
+    return 1
+}
+
+recipe_has_lib() {   # lib:pc1,pc2:hdr1,hdr2
+    # pkg-config answers the question meson would ask, but a library that ships
+    # no .pc file still counts when its headers are there.
+    local pcs="${1%%:*}" hdrs="${1#*:}" pc found=0
+    if command -v pkg-config >/dev/null 2>&1; then
+        for pc in ${pcs//,/ }; do
+            pkg-config --exists "${pc}" 2>/dev/null || found=1
+        done
+        [[ "${found}" -eq 0 ]] && return 0
+    fi
+    recipe_has_hdr "${hdrs}"
+}
+
+# The same three probes build.sh asks the host with, and a trimmed copy on
+# purpose: fn: exists there for the core's own quirks (Fedora ships some of
+# perl's modules in packages of their own) and is not something a recipe needs.
+# The two scripts cannot share the code because they run in different places --
+# build.sh on the host, this one in the image -- and neither can ask the other.
+recipe_dep_present() {   # <spec>
+    case "${1}" in
+        cmd:*) recipe_has_cmd "${1#cmd:}" ;;
+        hdr:*) recipe_has_hdr "${1#hdr:}" ;;
+        lib:*) recipe_has_lib "${1#lib:}" ;;
+    esac
+}
+
+build_extensions() {
+    local dir recipe name tarball got strip marker before after
+    local ext_src f n dep
+    local -a found=() ext_added=()
+    local -A ctl_before=()
+
+    echo "=== Step 3b: Build extensions (from source) ==="
+
+    for dir in "${ext_specs[@]}"; do
+        dir="${dir%/}"
+
+        # One recipe per directory, because that is what build.sh puts there.
+        # Two would leave no way to tell which was meant.
+        found=()
+        for f in "${dir}"/*.sh; do
+            [[ -e "${f}" ]] || continue
+            found+=("${f}")
+        done
+        if [[ ${#found[@]} -ne 1 ]]; then
+            echo "ERROR: ${dir} holds ${#found[@]} recipes (*.sh), expected one." >&2
+            echo "       The directory is assembled by build.sh, which puts a" >&2
+            echo "       recipe and the source it names in it." >&2
+            exit 1
+        fi
+        recipe="${found[0]}"
+        name="$(basename "${recipe}" .sh)"
+
+        # The unsets are not tidiness: a recipe that forgot EXT_DEPS would
+        # otherwise inherit the previous recipe's, and quietly probe for the
+        # wrong thing.
+        unset EXT_DESC EXT_URL EXT_SHA256 EXT_DEPS EXT_STRIP
+        unset -f ext_build
+        # shellcheck source=/dev/null
+        source "${recipe}"
+
+        if [[ -z "${EXT_URL:-}" || -z "${EXT_SHA256:-}" ]]; then
+            echo "ERROR: ${name}: the recipe declares no EXT_URL / EXT_SHA256." >&2
+            echo "       build.sh fetches the source from EXT_URL and pins it by" >&2
+            echo "       EXT_SHA256; the contract is in extensions/README.md." >&2
+            exit 1
+        fi
+        if [[ ! "${EXT_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ERROR: ${name}: EXT_SHA256 is not a sha256 sum: ${EXT_SHA256}" >&2
+            exit 1
+        fi
+        if ! declare -F ext_build >/dev/null; then
+            echo "ERROR: ${name}: the recipe defines no ext_build() function." >&2
+            echo "       That function holds the build commands -- see" >&2
+            echo "       extensions/README.md." >&2
+            exit 1
+        fi
+
+        # Dependencies before the unpack: one that is missing is a package the
+        # image or the host should have, which is a different fix from anything
+        # the recipe's own build system would report further down.
+        for dep in ${EXT_DEPS[@]+"${EXT_DEPS[@]}"}; do
+            case "${dep}" in
+                cmd:*|hdr:*|lib:*) ;;
+                *)
+                    echo "ERROR: ${name}: '${dep}' is not a dependency spec." >&2
+                    echo "       A recipe declares cmd:..., hdr:... or lib:...." >&2
+                    exit 1
+                    ;;
+            esac
+            if ! recipe_dep_present "${dep}"; then
+                echo "ERROR: ${name} needs ${dep}, and it is not here." >&2
+                if [[ "${PG_HOST_BUILD:-0}" = "1" ]]; then
+                    echo "       Install the package that provides it on this host" >&2
+                    echo "       and re-run. A host build does not install a" >&2
+                    echo "       recipe's dependencies for it: the package name is" >&2
+                    echo "       the distribution's business, and build.sh's table" >&2
+                    echo "       of them covers the core and nothing else." >&2
+                else
+                    echo "       Add it to the Containerfile: that apt list is" >&2
+                    echo "       where a recipe's build dependencies belong, and" >&2
+                    echo "       nothing is installed while this image runs." >&2
+                fi
+                exit 1
+            fi
+        done
+
+        tarball="${dir}/src.tar.gz"
+        if [[ ! -f "${tarball}" ]]; then
+            echo "ERROR: ${name}: no src.tar.gz beside the recipe in ${dir}." >&2
+            echo "       build.sh fetches what EXT_URL names and puts it there," >&2
+            echo "       so its being missing means the fetch did not happen." >&2
+            exit 1
+        fi
+        # Verified here as well as on the host, and this is the copy that gets
+        # unpacked: a cache entry left over from a different version would
+        # otherwise be built under this recipe's name, silently.
+        got="$(sha256sum "${tarball}" | awk '{print $1}')"
+        if [[ "${got}" != "${EXT_SHA256,,}" ]]; then
+            echo "ERROR: ${name}: the source does not match the recipe's EXT_SHA256." >&2
+            echo "       expected ${EXT_SHA256,,}" >&2
+            echo "       got      ${got}" >&2
+            echo "       Remove the cached tarball for this recipe and re-run." >&2
+            exit 1
+        fi
+
+        ext_src="$(mktemp -d "${TMPDIR:-/tmp}/pg-ext-${name}.XXXXXX")"
+        strip="${EXT_STRIP:-1}"
+        if ! tar -xf "${tarball}" -C "${ext_src}" --strip-components="${strip}"; then
+            echo "ERROR: ${name}: could not unpack $(basename "${tarball}")" >&2
+            exit 1
+        fi
+        # A tarball whose top level is not the single directory EXT_STRIP
+        # assumes leaves an empty tree rather than an error, and the recipe's
+        # build then fails somewhere inside its own tooling with nothing
+        # pointing back here.
+        if [[ -z "$(ls -A "${ext_src}")" ]]; then
+            echo "ERROR: ${name}: nothing was left after unpacking with" >&2
+            echo "       EXT_STRIP=${strip}; the tarball's top level is not what" >&2
+            echo "       that assumes." >&2
+            exit 1
+        fi
+
+        echo ""
+        echo "--- ${name}: ${EXT_DESC:-extension} ---"
+        echo "  from ${EXT_URL}"
+        echo "  against ${PREFIX}"
+
+        # What the recipe is given, and all it needs to know: pg_config is the
+        # prefix just built, so PGXS installs into it and nowhere else.
+        PG_MAJOR="${PG_VERSION%%[!0-9]*}"
+        JOBS="$(nproc 2>/dev/null || echo 2)"
+        export PREFIX PG_VERSION PG_MAJOR JOBS
+        export PG_CONFIG="${PREFIX}/bin/pg_config"
+        export EXT_NAME="${name}" EXT_SRC="${ext_src}"
+
+        ctl_before=()
+        for f in "${PREFIX}"/share/postgresql/extension/*.control; do
+            [[ -e "${f}" ]] || continue
+            ctl_before["$(basename "${f}" .control)"]=1
+        done
+
+        marker="${ext_src}/.pg-portable-built"
+        touch "${marker}"
+        before="$(find "${PREFIX}" -type f 2>/dev/null | wc -l)"
+
+        # Run in a shell of its own with errexit on, not in a subshell here.
+        # A subshell in a tested position -- which is where a status has to be
+        # caught -- does not honour set -e for what runs inside it, not even
+        # with an explicit `set -e` in it (measured, not assumed). A recipe
+        # written as three plain commands would then carry on past the one that
+        # failed and report the status of the last, which is how a broken build
+        # comes out looking green. A new bash process gets errexit that works.
+        # The recipe is sourced again inside it, which is the one thing a
+        # recipe's top level may not rely on being run only once.
+        if ! bash -euo pipefail -c 'source "$1"; cd "$2"; ext_build' \
+                _ "${recipe}" "${ext_src}"; then
+            echo "" >&2
+            echo "ERROR: ${name}: ext_build failed; its output is above." >&2
+            # Where the tree it failed in still is depends on which half ran the
+            # build, and saying "left in place so that it can be looked at"
+            # unconditionally was wrong for the container half: the container is
+            # removed when it exits, so the path named there is one no host can
+            # read. Say what is true for the build that actually ran.
+            if [[ "${PG_HOST_BUILD:-0}" = "1" ]]; then
+                echo "       The source tree it ran in is ${ext_src}, left in place" >&2
+                echo "       so that it can be looked at, and so is the prefix it was" >&2
+                echo "       building against, ${PREFIX}: SKIP_BUILD=1 re-runs bundle.sh" >&2
+                echo "       against that prefix, which is how to iterate on a recipe" >&2
+                echo "       without compiling PostgreSQL again." >&2
+            else
+                echo "       The source tree it ran in was ${ext_src}, which is inside" >&2
+                echo "       the build container: the container is removed when the build" >&2
+                echo "       exits, so that path is not one this machine can read. To" >&2
+                echo "       iterate on a recipe with the tree in hand, run the build with" >&2
+                echo "       --without-container -- there the tree and the prefix both" >&2
+                echo "       survive, and SKIP_BUILD=1 re-runs against the prefix that" >&2
+                echo "       build installed." >&2
+            fi
+            exit 1
+        fi
+
+        # An install that ignored PG_CONFIG wrote somewhere under /usr instead,
+        # returned 0, and left the bundle without the extension -- the one
+        # failure here that is otherwise not noticed until the target machine.
+        # Either sign counts: more files than before, or something under the
+        # prefix rewritten in place, which is what installing over an earlier
+        # build's copy looks like.
+        after="$(find "${PREFIX}" -type f 2>/dev/null | wc -l)"
+        if [[ "${after}" -le "${before}" ]] &&
+           [[ -z "$(find "${PREFIX}" -newer "${marker}" -print -quit 2>/dev/null)" ]]; then
+            echo "ERROR: ${name}: ext_build returned 0 but nothing under" >&2
+            echo "       ${PREFIX} changed. The usual cause is a build that did" >&2
+            echo "       not pick up PG_CONFIG and installed into /usr/local." >&2
+            exit 1
+        fi
+
+        # Which extensions the recipe brought, read off the control files it
+        # wrote: that is the name CREATE EXTENSION wants, and a recipe's own
+        # name need not be it. Written-now counts
+        # as much as new, because installing a recipe over a prefix that already
+        # has it -- which is what SKIP_BUILD=1 does while a recipe is being
+        # worked on -- adds no file and still put every one of them there.
+        ext_added=()
+        for f in "${PREFIX}"/share/postgresql/extension/*.control; do
+            [[ -e "${f}" ]] || continue
+            n="$(basename "${f}" .control)"
+            if [[ -z "${ctl_before[${n}]:-}" ]] || [[ "${f}" -nt "${marker}" ]]; then
+                ext_added+=("${n}")
+            fi
+        done
+        if [[ ${#ext_added[@]} -gt 0 ]]; then
+            ext_installed+=("${ext_added[@]}")
+            printf '  installed: %s\n' "${ext_added[*]}"
+        else
+            printf '  installed: no .control file, so nothing for CREATE EXTENSION\n'
+        fi
+
+        rm -rf "${ext_src}"
+    done
+
+    if [[ ${#ext_installed[@]} -gt 0 ]]; then
+        echo ""
+        printf '  extensions available: %s\n' "${ext_installed[*]}"
+    fi
+}
+
+if [[ ${#ext_specs[@]} -gt 0 ]]; then
+    build_extensions
+fi
+
 # -- Bundle -------------------------------------------------------------
 echo "=== Step 4: Prepare bundle ==="
 # BUNDLE is a bind mount inside the container, so removing the directory itself
@@ -255,12 +661,33 @@ if [[ ! -d "${BUNDLE}" ]]; then
     echo "ERROR: bundle directory ${BUNDLE} does not exist (is /out mounted?)" >&2
     exit 1
 fi
-find "${BUNDLE}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+# The lock taken above lives in here and has to survive the empty-out, or the
+# build would drop the very thing that keeps a second one out.
+find "${BUNDLE}" -mindepth 1 -maxdepth 1 \
+    ! -name '.pg-portable.lock' ! -name '.pg-portable.lock.d' \
+    -exec rm -rf -- {} +
 mkdir -p "${BUNDLE}/bin" "${BUNDLE}/lib"
 
 # glibc itself, the dynamic loader, and the NSS modules glibc dlopen()s by bare
 # soname. These must never be touched by patchelf.
 NO_PATCH_RE='^(ld-linux.*|libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|libresolv\.so\.2|librt\.so\.1|libnss_[a-z0-9]*\.so\.2)$'
+
+# Which of the two dynamic path tags a file carries. The distinction is not
+# cosmetic: the loader searches DT_RPATH *before* --library-path and
+# LD_LIBRARY_PATH, and DT_RUNPATH *after* both. So a stale or foreign
+# DT_RUNPATH is harmless here -- the launcher's --library-path outranks it --
+# while a DT_RPATH is a portability hole: the object would resolve that library
+# from the machine it was linked on, and succeed, instead of failing loudly.
+#
+# Read with readelf rather than "patchelf --print-rpath": that reports the
+# *effective* rpath without saying which tag it came from, so it cannot tell
+# the harmless case from the fatal one, and it does not exist on a host that
+# has no patchelf. Both names are matched with their parentheses -- "RPATH" is
+# not a substring of "RUNPATH", but anchoring removes the doubt.
+rpath_tag() {   # <file> -> RPATH | RUNPATH | (empty)
+    readelf -d -- "$1" 2>/dev/null \
+        | awk '/\(RPATH\)/{print "RPATH"; exit} /\(RUNPATH\)/{print "RUNPATH"; exit}'
+}
 
 patch_rpath() {
     local f="$1" rpath="$2" b
@@ -268,8 +695,28 @@ patch_rpath() {
     b="$(basename "${f}")"
     [[ "${b}" =~ ${NO_PATCH_RE} ]] && return 0
     file -b -- "${f}" | grep -qE '^ELF' || return 0
-    patchelf --remove-rpath -- "${f}" 2>/dev/null || true
-    patchelf --set-rpath "${rpath}" -- "${f}" 2>/dev/null || true
+    # No "--" separator, and this is load-bearing. patchelf 0.14.3 -- what
+    # Debian bookworm ships, and so what this build image has -- has no case
+    # for a bare "--" in its argument loop; it falls through to the catch-all
+    # that collects file names, so the invocation means "patch the two files
+    # -- and <f>", and the loop throws on the first one before the real file is
+    # ever opened. Between that and 2>/dev/null, this function did nothing at
+    # all for as long as the separator was there. Every caller passes an
+    # absolute ${BUNDLE}/... path, so no argument can begin with "-" and the
+    # separator buys nothing anyway.
+    # --set-rpath alone is enough: it replaces the value, and it demotes a
+    # DT_RPATH to DT_RUNPATH as a side effect, which is the half that matters.
+    patchelf --set-rpath "${rpath}" "${f}" >/dev/null 2>&1 || true
+    # Never trust the write. Failing here means patchelf is missing or refused,
+    # and the difference between "no rpath" and "a stale DT_RPATH" is the
+    # difference between a bundle that works anywhere and one that silently
+    # picks up libraries from the machine it was built on.
+    if [[ "$(rpath_tag "${f}")" = "RPATH" ]]; then
+        echo "ERROR: DT_RPATH survived on ${f#"${BUNDLE}"/}: patchelf is missing" >&2
+        echo "       or failed. DT_RPATH is searched before --library-path, so" >&2
+        echo "       that object would resolve libraries from outside the bundle." >&2
+        exit 1
+    fi
 }
 
 # Libraries loaded by dlopen() never show up in ldd output, so they get their
@@ -726,18 +1173,11 @@ if [[ "${WITH_SERVER}" = true ]]; then
     add_deps $(find "${BUNDLE}/${PY_LIBDIR}/python${PY_VER}" "${BUNDLE}/lib/perl" "${BUNDLE}/lib/${TCL_VER}" \
         -type f -name '*.so*' 2>/dev/null)
     flush_deps
+
 fi
 
 echo "=== Step 10: Rebuild SONAME symlinks ==="
-shopt -s nullglob
-for f in "${BUNDLE}/lib/"*.so.*; do
-    [[ -f "${f}" && ! -L "${f}" ]] || continue
-    soname="$(patchelf --print-soname "${f}" 2>/dev/null || true)"
-    [[ -n "${soname}" ]] || continue
-    [[ "${soname}" = "$(basename "${f}")" ]] && continue
-    ln -sf "$(basename "${f}")" "${BUNDLE}/lib/${soname}"
-done
-shopt -u nullglob
+rebuild_soname_links
 
 echo "=== Step 11: Create launcher wrappers ==="
 # bash >= 5.2 expands "&" in the *replacement* of ${var//pat/rep} to the text
@@ -893,16 +1333,40 @@ fi
 echo "  all symlinks resolve inside the bundle"
 
 missing=0
+rpath_hits=()
 while IFS= read -r -d '' f; do
     file -b -- "${f}" | grep -qE '^ELF' || continue
+    # A DT_RPATH has no business being in here, and the check rides along with
+    # this loop rather than getting one of its own so that "is it ELF" is asked
+    # once per file instead of twice. patch_rpath verifies every file it
+    # touches; this verifies every file there is, including ones no pass ever
+    # patched. Today's bundle has none, so it costs a readelf per ELF and buys
+    # the invariant outright.
+    if [[ "$(rpath_tag "${f}")" = "RPATH" ]]; then
+        rpath_hits+=("${f#"${BUNDLE}"/}")
+    fi
+    # readelf, not "patchelf --print-needed": that call carried the same "--"
+    # separator that made patch_rpath a no-op, and patchelf collects a bare
+    # "--" as a file name too, so this assertion threw before it read anything
+    # and has been passing vacuously. readelf takes no separator and needs no
+    # patchelf, which also makes this work on a host build without it.
     while read -r so; do
         [[ -n "${so}" ]] || continue
         if [[ ! -e "${BUNDLE}/lib/${so}" ]]; then
             echo "  MISSING: ${so}  (needed by ${f#"${BUNDLE}"/})"
             missing=1
         fi
-    done < <(patchelf --print-needed -- "${f}" 2>/dev/null)
+    done < <(readelf -d -- "${f}" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
 done < <(find "${BUNDLE}" -type f -print0)
+if [[ ${#rpath_hits[@]} -gt 0 ]]; then
+    echo "ERROR: DT_RPATH found in the bundle:" >&2
+    printf '  %s\n' "${rpath_hits[@]}" | head -20 >&2
+    echo "       DT_RPATH is searched before --library-path, so these objects" >&2
+    echo "       would resolve their libraries from the machine they were" >&2
+    echo "       linked on rather than from the bundle." >&2
+    exit 1
+fi
+echo "  no object carries a DT_RPATH"
 if [[ "${missing}" != "0" ]]; then
     echo "ERROR: unresolved DT_NEEDED entries -- the bundle is not self-contained" >&2
     exit 1

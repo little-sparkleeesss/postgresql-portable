@@ -60,6 +60,7 @@ cd output/18.4-full
 - **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, LLVM, readline, zstd, …) is included, plus the glibc the binaries were built against
 - **Bundled interpreter runtimes** (`--full`) — the Python, Perl and Tcl runtimes that PL/Python, PL/Perl and PL/Tcl need
 - **Selectable locales** (`--locales`) — carry the glibc locale data for the languages you need, so `initdb --locale=zh_CN.UTF-8` works on a host that has no locales of its own
+- **Extensions built from source** (`--extension`) — a recipe of your own, compiled against the server's own prefix in the same image, so the module and its libraries go through the ordinary copy and `ldd` walk
 - **Cross-distro** — runs on any x86_64 Linux with kernel ≥ 5.x (verified: Debian bookworm → Debian bookworm and Rocky Linux 9)
 - **Optional host build** (`--without-container`) — compile without a container runtime at all; what the toolchain is missing is probed for and installed through apt or dnf
 
@@ -97,6 +98,9 @@ Kerberos, LDAP, ICU, LLVM, …) is installed on the host instead, through apt
 
 # …and able to run initdb --locale=zh_CN.UTF-8 on a host that has no locales
 ./build.sh 18.4 --full --locales=zh_CN.UTF-8,en_US.UTF-8
+
+# …plus an extension, built from a recipe of your own
+./build.sh 18.4 --full --extension=./myext.sh
 
 # Beta / RC
 ./build.sh 19beta1 --full
@@ -151,6 +155,8 @@ upstream has.
 |--------|-------------|
 | `--full` | Build the client + server bundle (both tool sets) |
 | `--locales=LIST` | Carry these glibc locales besides `C.UTF-8`: comma separated names, or `all`. Needs `--full` |
+| `--extension=NAME` | Build that extension from source, with the recipe `extensions/<name>.sh` — one you add. Repeatable. Needs `--full` |
+| `--extension=PATH` | The same, from a recipe of your own: `./myext.sh`. Repeatable, and mixes with names. Needs `--full` |
 | `--no-download` | Skip downloading; fail if tarball is not cached |
 | `--cache-dir DIR` | Set cache directory (default: `./cache`) |
 | `--without-container` | Compile on the host instead of in a container |
@@ -195,6 +201,106 @@ set is present for them to resolve against.
 Host builds need the same data. `locales-all` provides it; so does the much
 smaller `locales` package, whose definitions `bundle.sh` compiles with
 `localedef` instead of copying.
+
+### Extensions
+
+`--extension` builds a third-party extension into a `--full` bundle, from
+source, the way the server itself is built. Nothing is added unless you name
+it: without `--extension` the bundle carries PostgreSQL's own contrib modules
+and no third-party extension at all. There are two ways to name one:
+
+```bash
+# By name: extensions/myext.sh, looked up in this repository
+./build.sh 18.4 --full --extension=myext
+
+# By path: a recipe of your own, anywhere
+./build.sh 18.4 --full --extension=./myext.sh
+
+output/18.4-full/bin/psql -h /tmp -p 5433 -U postgres -c 'CREATE EXTENSION myext'
+```
+
+A recipe is a shell file holding what you would type on a host to build that
+extension from source. Nothing about PostgreSQL's build is repeated in it —
+the prefix goes in as `pg_config`, and PGXS or `--with-pgconfig` finds the rest.
+The sketch below is the smallest recipe there is: a PGXS project whose install
+`pg_config` already knows how to place.
+
+```sh
+# extensions/myext.sh
+EXT_DESC="myext -- what it does"
+EXT_URL="https://example.invalid/myext-1.2.3.tar.gz"
+EXT_SHA256="<64 hex digits>"
+
+ext_build() {
+    make PG_CONFIG="$PG_CONFIG" -j"$JOBS"
+    make PG_CONFIG="$PG_CONFIG" install
+}
+```
+
+`build.sh` reads the declarations, fetches `EXT_URL` **on the host** — the
+cache, the checksum and `--no-download` are the arrangement the PostgreSQL
+tarball already has, and the build container needs no network at all — and puts
+the recipe and its source into one directory per extension. `bundle.sh` sources
+the recipe, probes `EXT_DEPS`, unpacks the tarball and runs `ext_build` with
+`PG_CONFIG` pointing at the prefix it has just installed.
+
+From there it is the ordinary pipeline, with no branch for extensions at all:
+the module is copied into `lib/postgresql/` by the same `cp` that takes the
+server's own modules, its libraries are collected by the same `ldd` walk, and
+Step 12b asserts that every one of them resolves inside the bundle.
+
+[`extensions/README.md`](extensions/README.md) is the contract in full: what a
+recipe declares, the environment `ext_build` is given, the dependency probes,
+and what a recipe may not do.
+
+**Why build rather than import.** A compiled extension is linked against the
+same glibc, the same OpenSSL and the same LLVM as the binaries beside it. An
+extension absorbed from a distribution's archive is not — it was built on
+somebody else's base — and *that* is what needed a verification apparatus per
+package: is its glibc new enough, does every library it loads resolve from the
+bundle alone, does the loader agree. Compiling in the same image deletes the
+whole class, because there is no second provenance to check.
+
+**Dependencies** are declared as capabilities, not package names, in `EXT_DEPS`
+— `lib:geos:geos_c.h`, `hdr:json-c/json.h`, `cmd:autoconf` — because the
+package that provides one is named differently on every distribution. In the
+build image they are the `Containerfile`'s business, and that apt list is the
+only place a package can come from; on a host build they are reported and never
+installed. Either way a missing one is named before anything is unpacked,
+rather than surfacing inside the extension's own `configure`.
+
+Three things worth knowing:
+
+- **A recipe's name is not the extension's name.** A recipe is a file here; the
+  extension is what its `.control` file declares, and that is the name
+  `CREATE EXTENSION` and `verify.sh` take. The build reports the names it found,
+  read off the control files the recipe installed:
+
+  ```bash
+  VERIFY_EXTENSIONS=<control name> ./verify.sh output/18.4-full
+  ```
+
+- **`--extension` does not change the output path.** `./build.sh 18.4 --full`
+  always writes `output/18.4-full`, so a later build without the flag replaces a
+  bundle that had the extension. There is nothing on the bundle that records
+  otherwise; keep the recipe and the bundle together, or keep the bundle.
+
+- **A recipe pins one version.** `EXT_SHA256` is the whole of the trust in the
+  source and the name of the cached tarball, so bumping the version in a recipe
+  fetches a second copy rather than colliding with the first. Nothing checks
+  that the version a recipe pins still supports the server it is being built
+  against: a module for the wrong major is refused by `PG_MODULE_MAGIC` when it
+  loads, and nowhere earlier.
+
+There was a second route once: an `--extension` that named a distribution
+package, resolved by apt against the PostgreSQL archive in the build image, and
+absorbed the `.deb` it produced. It is gone, along with the archive, and the
+reason is the paragraph above — a prebuilt package needs a compatibility check
+that a compiled one does not, and paying for that apparatus to avoid a compile
+was the wrong trade. An extension that only ships binaries is not supported;
+every extension worth building ships source, and a project that publishes only
+through git wants the archive tarball of a tag, which `EXT_URL` can name and
+`EXT_SHA256` can pin.
 
 ### Building on the host
 
@@ -263,7 +369,8 @@ output/18.4-full/
 │   ├── locale/zh_CN.utf8/        ← …and any others --locales asked for,
 │   │                                under the folded name glibc looks up
 │   └── postgresql/               ← loadable modules: plpgsql, plperl, plpython3,
-│                                    pltcl, llvmjit, all contrib extensions
+│                                    pltcl, llvmjit, all contrib extensions,
+│                                    plus any --extension brought (myext.so, …)
 └── share/
     ├── postgresql/               ← timezone data, extension SQL, sample configs
     └── locale/                   ← NLS message catalogues
@@ -300,13 +407,17 @@ so a missing library fails loudly instead of silently picking up a host copy.
 
 1. Parses the version argument
 2. With `--without-container`: probes the host for the build toolchain and
-   installs what is missing (apt or dnf), then runs
-   `bundle.sh` directly on the working copy
+   installs what is missing (apt or dnf)
 3. Downloads `postgresql-{version}.tar.bz2` and its `.sha256` from the official PostgreSQL FTP
 4. Verifies the checksum
 5. Extracts the source (cached for future runs)
-6. Builds the image from `Containerfile`
-7. Runs the container as the invoking user, with the source (read-only) and output directory mounted
+6. Fetches each `--extension` recipe's source and checks it against the
+   checksum the recipe pins, then lays the recipe and its tarball out in one
+   directory per extension, read-only at a generated path
+7. Builds the image from `Containerfile` and runs it as the invoking user —
+   or, with `--without-container`, runs `bundle.sh` on the working copy —
+   with the source (read-only) and output directory mounted, so the paths the
+   build sees are its own and one with a space in it cannot be mistaken for two
 
 ### bundle.sh (inside the container)
 
@@ -317,24 +428,33 @@ so a missing library fails loudly instead of silently picking up a host copy.
    server-only ones off.
 2. Reads the compiled-in `PGBINDIR`/`PGSHAREDIR`/`PKGLIBDIR`/`LOCALEDIR` out of the
    generated `pg_config_paths.h` rather than hardcoding them
-3. Copies the programs of the mode's tool set, then runs `ldd` over them to
+3. Builds any `--extension` into that prefix (see *Extensions*): sources the
+   recipe, probes what it says it needs, unpacks its tarball and runs
+   `ext_build` against the prefix just installed, checking that something under
+   that prefix actually changed. Two things about where this sits are the whole
+   trick: it is after the install, so it has a `pg_config` to hand over, and
+   before the copies below, so the new module is copied and its libraries are
+   collected as if it had always been part of the server
+4. Copies the programs of the mode's tool set, then runs `ldd` over them to
    collect shared library dependencies
-4. Adds the libraries `ldd` cannot see: `libpq`/`libecpg`/`libpgtypes` are taken
+5. Adds the libraries `ldd` cannot see: `libpq`/`libecpg`/`libpgtypes` are taken
    straight out of the install prefix — the build uses `-Drpath=false`, so
    nothing resolves them and no `ldd` pass ever walks *into* them. Their
    dependency chain is then collected level by level, because a libpq client is
    dead without it (`libpq` → `libssl`, `libgssapi_krb5`, `libldap` →
    `libkrb5`, `libsasl2`, …). Added the same way are the `libnss_*.so.2` modules
    glibc `dlopen()`s by name and the `.so` files inside the interpreter trees
-5. Copies the server payload (`--full`): loadable modules,
-   `share/postgresql`, `share/locale`, the interpreter runtimes, the locales
-   `--locales` asked for, and the glibc
-   locale data for `C.UTF-8`
-6. `patchelf --set-rpath` on everything except glibc itself, the loader and the NSS
+6. Copies the server payload (`--full`): loadable modules, `share/postgresql`,
+   `share/locale`, the interpreter runtimes, the locales `--locales` asked for,
+   and the glibc locale data for `C.UTF-8`. An extension installed into those
+   same two trees in step 3, so it comes along here
+7. `patchelf --set-rpath` on everything except glibc itself, the loader and the NSS
    modules; rebuilds SONAME symlinks
-7. Replaces each executable with a wrapper script
-8. Asserts that every `DT_NEEDED` entry of every bundled ELF resolves inside the
-   bundle, then writes the launcher wrappers
+8. Replaces each executable with a wrapper script
+9. Asserts that no bundled object carries a `DT_RPATH` — that tag outranks the
+   launcher's `--library-path`, so it would resolve libraries from whatever
+   machine the object was built on — and that every `DT_NEEDED` entry of every
+   bundled ELF resolves inside the bundle
 
 ### Why it is relocatable
 
@@ -440,8 +560,15 @@ Some things are host policy by nature, and bundling them would be wrong:
 
 Building third-party extensions against this bundle is **not supported**: the
 `include/` tree and `lib/postgresql/pgxs/` are not bundled, so `pg_config`
-reports include paths that do not exist. Pure-SQL extensions that ship their own
-`.control` and `.sql` files can still be installed with `CREATE EXTENSION`.
+reports include paths that do not exist. That is about compiling one *on the
+target machine, against the bundle*. Compiling one at build time is a different
+thing and is supported — see [`--extension`](#extensions), which builds from
+source against the prefix inside the build, and never makes any of those paths
+real. `verify.sh` reads the same distinction: `VERIFY_EXTENSIONS` runs `CREATE
+EXTENSION` and `LOAD` against the finished bundle.
+
+Pure-SQL extensions that ship their own `.control` and `.sql` files can be
+installed with `CREATE EXTENSION` either way.
 
 ## Directory structure
 
@@ -450,6 +577,9 @@ postgresql-portable/
 ├── build.sh              # Entry point: download → verify → build
 ├── bundle.sh             # Container entrypoint: compile → collect → patch → wrap
 ├── Containerfile         # Build environment (Debian Bookworm + TUNA mirror)
+├── extensions/           # One recipe per extension --extension can build
+│   └── README.md         #   …and the contract they are written against
+├── verify.sh             # End-to-end check of a finished bundle
 ├── LICENSE               # MIT
 ├── README.md
 ├── cache/                # Downloaded tarballs and extracted source

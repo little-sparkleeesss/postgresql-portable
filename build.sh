@@ -8,7 +8,7 @@ PG_FTP_BASE="https://ftp.postgresql.org/pub/source"
 # -- usage ------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 <version> [--full] [--locales=LIST] [--no-download]
+Usage: $0 <version> [--full] [--locales=LIST] [--extension=NAME|PATH] [--no-download]
           [--cache-dir DIR] [--without-container] [--skip-deps] [--yes]
 
 Modes:
@@ -57,6 +57,33 @@ Locales:
                        host's locale-archive lookup -- read the README first if
                        the target host keeps its locales there.
 
+Extensions:
+  --extension=NAME     Build the extension NAME from source, with the recipe
+                       extensions/<name>.sh. The recipe holds what you would
+                       type on a host -- where the source comes from, what it
+                       needs, how it is built -- and this script does the rest.
+                       Read extensions/README.md before writing one.
+  --extension=PATH     The same, from a recipe of your own: ./myext.sh. A path
+                       starts with '/', './' or '../'.
+
+                       Both forms are repeatable and mix freely, and both need
+                       --full. Nothing is fetched inside the build container:
+                       the source is downloaded here, verified against the
+                       recipe's own EXT_SHA256, cached under the cache
+                       directory, and mounted read-only -- so --no-download
+                       reaches extensions exactly the way it reaches the
+                       PostgreSQL tarball. The extension is then compiled
+                       against the prefix this build installed, in the same
+                       image as the server, which is what lets the ordinary
+                       copy and dependency walk take it in: a module linked
+                       against the same glibc, OpenSSL and LLVM as the binaries
+                       beside it needs no machinery of its own.
+                       A recipe's own dependencies (EXT_DEPS) are probed: in
+                       the build image they are the Containerfile's business,
+                       and on a host build they are reported, never installed
+                       -- the package that provides a capability is named
+                       differently on every distribution.
+
 Host build:
   --without-container  Compile on this machine instead of in a container. Needs
                        the same toolchain the Containerfile installs; what is
@@ -76,6 +103,8 @@ Examples:
   $0 19beta1 --full       build PG 19 beta 1 (all features enabled)
   $0 18.4 --full --locales=zh_CN.UTF-8,en_US.UTF-8   carry two locales
   $0 18.4 --full --locales=all                       carry every locale
+  $0 18.4 --full --extension=my-ext   build it from extensions/my-ext.sh
+  $0 18.4 --full --extension=my-ext --extension=./other.sh   two of them
   $0 18.4 --no-download   skip download, use existing cache
   $0 /path/to/pg-src      build from local source tree
   $0 18.4 --without-container   build on this host, installing what is missing
@@ -94,6 +123,8 @@ SKIP_DEPS=false
 ASSUME_YES=false
 LOCALES=""
 LOCALES_GIVEN=false
+declare -a EXTENSIONS=()
+EXTENSIONS_GIVEN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -126,6 +157,24 @@ while [[ $# -gt 0 ]]; do
             LOCALES_GIVEN=true
             shift
             ;;
+        --extension)
+            # Checked rather than left to "$2" alone: a trailing --extension
+            # would trip set -u on an unbound $2 before any message of ours
+            # could say what is wrong.
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --extension needs a value: the name of a recipe" >&2
+                echo "       under extensions/, or the path of one of your own." >&2
+                exit 1
+            fi
+            EXTENSIONS+=("$2")
+            EXTENSIONS_GIVEN=true
+            shift 2
+            ;;
+        --extension=*)
+            EXTENSIONS+=("${1#*=}")
+            EXTENSIONS_GIVEN=true
+            shift
+            ;;
         --without-container)
             WITHOUT_CONTAINER=true
             shift
@@ -156,6 +205,128 @@ if [[ -z "${VERSION}" ]]; then
     echo "ERROR: version argument is required"
     usage
 fi
+
+# -- a --extension value is a recipe name or a path to one --------------
+# A name is a recipe under extensions/, <name>.sh; a path is one of your own.
+# The split is on the first character, and it is not "does this file exist": a
+# mistyped path has to come back as a mistyped path rather than quietly
+# becoming a lookup for a recipe of that name, and a name that happens to match
+# a file in the working directory is still a name.
+#
+# What a recipe *is* -- the data half of it, at least -- is in
+# extensions/README.md. This is the half that can be read without a PostgreSQL
+# prefix: where the source comes from, what pins it, what it needs. The
+# commands wait for bundle.sh, which is the only place with a prefix to build
+# against.
+EXT_RECIPES=()      # absolute paths, one per --extension
+EXT_NAMES=()        # what to call each in the log and in the cache
+EXT_HEADERS=()      # "url|sha256|deps|description", parallel to the above
+
+ext_recipe_header() {   # <recipe> -> "url|sha256|deps|description"
+    # Sourced in a subshell, so whatever a recipe does at its top level happens
+    # to a copy of this shell rather than to the one running the build. A
+    # recipe is not *supposed* to do anything there, but the point of doing it
+    # this way is not having to trust that.
+    bash -c '
+        unset EXT_DESC EXT_URL EXT_SHA256 EXT_DEPS EXT_STRIP
+        # shellcheck source=/dev/null
+        source "$1"
+        printf "%s|%s|%s|%s\n" "${EXT_URL:-}" "${EXT_SHA256:-}" \
+            "${EXT_DEPS[*]:-}" "${EXT_DESC:-}"
+    ' _ "$1"
+}
+
+ext_list_recipes() {
+    local f any=0
+    for f in "${SCRIPT_DIR}"/extensions/*.sh; do
+        [[ -f "${f}" ]] || continue
+        printf '         %s\n' "$(basename "${f}" .sh)" >&2
+        any=1
+    done
+    [[ "${any}" = 1 ]] || echo "         (this repository ships none yet)" >&2
+}
+
+resolve_extensions() {
+    local ext name file header url sha deps desc
+    for ext in ${EXTENSIONS[@]+"${EXTENSIONS[@]}"}; do
+        case "${ext}" in
+            /*|./*|../*)                     # a path: a recipe you wrote
+                if [[ -d "${ext}" ]]; then
+                    echo "ERROR: --extension: ${ext} is a directory. A path names" >&2
+                    echo "       one recipe file -- there is nothing to look up" >&2
+                    echo "       inside it." >&2
+                    exit 1
+                fi
+                if [[ ! -f "${ext}" ]]; then
+                    echo "ERROR: --extension: ${ext} is not a file." >&2
+                    exit 1
+                fi
+                file="$(cd "$(dirname "${ext}")" && pwd -P)/$(basename "${ext}")"
+                ;;
+            */*)
+                echo "ERROR: --extension: '${ext}' is neither a name nor a path." >&2
+                echo "       A path starts with '/', './' or '../'; a name is one" >&2
+                echo "       looked up under extensions/." >&2
+                exit 1
+                ;;
+            *)                               # a name: a recipe of ours
+                # ".sh" is accepted and dropped, so the name of the file and
+                # the name of the extension are the same word either way.
+                name="${ext%.sh}"
+                case "${name}" in
+                    ""|.|..|-*|.*)
+                        echo "ERROR: --extension: '${ext}' is not a usable recipe" >&2
+                        echo "       name." >&2
+                        exit 1
+                        ;;
+                esac
+                file="${SCRIPT_DIR}/extensions/${name}.sh"
+                if [[ ! -f "${file}" ]]; then
+                    echo "ERROR: --extension: no recipe named '${name}' under" >&2
+                    echo "       extensions/. Recipes here:" >&2
+                    ext_list_recipes
+                    echo "       A recipe of your own is passed as a path, e.g." >&2
+                    echo "       --extension=./myext.sh" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+
+        header="$(ext_recipe_header "${file}")"
+        IFS='|' read -r url sha deps desc <<<"${header}"
+        if [[ -z "${url}" || -z "${sha}" ]]; then
+            echo "ERROR: --extension: $(basename "${file}") declares no" >&2
+            echo "       EXT_URL / EXT_SHA256, so there is nothing to fetch and" >&2
+            echo "       nothing to check it against. The contract is in" >&2
+            echo "       extensions/README.md." >&2
+            exit 1
+        fi
+        if [[ ! "${sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ERROR: --extension: $(basename "${file}") has an EXT_SHA256" >&2
+            echo "       that is not a sha256 sum: ${sha}" >&2
+            exit 1
+        fi
+        # The same three kinds of probe bundle.sh accepts. Checked here as well
+        # because this is where a typo can still be answered cheaply, and
+        # because a spec that is not one of the three has no probe function
+        # behind it -- dep_probe below would run one that does not exist.
+        for dep in ${deps}; do
+            case "${dep}" in
+                cmd:*|hdr:*|lib:*) ;;
+                *)
+                    echo "ERROR: --extension: $(basename "${file}") declares" >&2
+                    echo "       '${dep}' as a dependency, which is not one: a" >&2
+                    echo "       recipe asks for cmd:..., hdr:... or lib:...." >&2
+                    exit 1
+                    ;;
+            esac
+        done
+
+        EXT_RECIPES+=("${file}")
+        EXT_NAMES+=("$(basename "${file}" .sh)")
+        EXT_HEADERS+=("${header}")
+    done
+}
 
 # -- validate --locales -----------------------------------------------
 # Each name ends up as a directory inside the bundle, and the container writes
@@ -201,6 +372,21 @@ if [[ "${LOCALES_GIVEN}" = true ]]; then
         echo "ERROR: --locales needs --full. The locale data lives in the server" >&2
         echo "       payload, and a client build also has PostgreSQL's own message" >&2
         echo "       catalogues compiled out, so there would be nothing to read it." >&2
+        exit 1
+    fi
+fi
+
+if [[ "${EXTENSIONS_GIVEN}" = true ]]; then
+    if [[ ${#EXTENSIONS[@]} -eq 0 ]]; then
+        echo "ERROR: --extension needs a value: the name of a recipe under" >&2
+        echo "       extensions/, or the path of one of your own (./myext.sh)." >&2
+        exit 1
+    fi
+    resolve_extensions
+    if [[ "${BUILD_MODE}" = "client" ]]; then
+        echo "ERROR: --extension needs --full. An extension is server payload: its" >&2
+        echo "       module goes to lib/postgresql/ and its .control and .sql to" >&2
+        echo "       share/postgresql/extension/, and a client bundle has neither." >&2
         exit 1
     fi
 fi
@@ -264,7 +450,6 @@ fi
 #          built, while Debian has all three in perl itself.
 #
 read -r -d '' HOST_DEPS <<'EOF' || true
-# id        | modes       | probe                                  | dnf provides                                                           | apt candidates
 cc          | all         | cmd:cc                                 | /usr/bin/cc                                                            | build-essential gcc
 meson       | all         | cmd:meson                              | /usr/bin/meson                                                         | meson
 ninja       | all         | cmd:ninja                              | /usr/bin/ninja                                                         | ninja-build
@@ -272,7 +457,7 @@ pkgconf     | all         | cmd:pkg-config                         | /usr/bin/pk
 bison       | all         | cmd:bison                              | /usr/bin/bison                                                         | bison
 flex        | all         | cmd:flex                               | /usr/bin/flex                                                          | flex
 perl        | all         | cmd:perl                               | /usr/bin/perl                                                          | perl
-binutils    | all         | cmd:ldd                                | /usr/bin/ldd                                                           | binutils
+binutils    | all         | cmd:readelf                            | /usr/bin/readelf                                                       | binutils
 patchelf    | all         | cmd:patchelf                           | /usr/bin/patchelf                                                      | patchelf
 file        | all         | cmd:file                               | /usr/bin/file                                                          | file
 curl        | download    | cmd:curl                               | /usr/bin/curl                                                          | curl
@@ -757,8 +942,48 @@ provision_host_deps() {
     fi
 }
 
+# -- what the recipes need on this host ---------------------------------
+# Reported, never installed, and the split is deliberate. The table above
+# exists because a core dependency's package name differs between
+# distributions and guessing one is how a build rots; for a recipe there is
+# nothing to guess from, so the honest answer is the capability that is
+# missing. Saying it here also puts the answer before the compile rather than
+# twenty minutes into it, which is the whole reason the core's dependencies are
+# probed up front too.
+#
+# Host builds only. In a container build a recipe's dependencies are the
+# image's business, and probing this machine for them would report on the wrong
+# one -- bundle.sh does that check inside the image, where the answer means
+# something.
+check_recipe_deps() {
+    local i dep name entry
+    local -a missing=()
+    for i in "${!EXT_RECIPES[@]}"; do
+        IFS='|' read -r _url _sha deps _desc <<<"${EXT_HEADERS[i]}"
+        name="${EXT_NAMES[i]}"
+        for dep in ${deps}; do
+            dep_probe "${dep}" || missing+=("${name}|${dep}")
+        done
+    done
+    [[ ${#missing[@]} -gt 0 ]] || return 0
+
+    echo ""
+    echo "Recipes ask for these build dependencies, and this host has none of them:"
+    for entry in "${missing[@]}"; do
+        IFS='|' read -r name dep <<<"${entry}"
+        printf '  %-12s %s\n' "${name}" "${dep}"
+    done
+    echo "Install them with this distribution's package manager. They are not"
+    echo "installed for you because the package that provides a capability is a"
+    echo "different name on every distribution, which is the same reason the"
+    echo "table above names the core's by hand."
+}
+
 if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     provision_host_deps
+    if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
+        check_recipe_deps
+    fi
 fi
 
 # =====================================================================
@@ -927,6 +1152,102 @@ if [[ "${WITHOUT_CONTAINER}" = false ]]; then
     fi
 fi
 
+# -- extension sources -------------------------------------------------
+# Fetched here, on the host, for the same reason the PostgreSQL tarball is: the
+# cache, the checksum and --no-download are one arrangement in one place, and
+# the build then works from a tree it can trust. It also means the build
+# container needs no network at all -- the image has no repository configured
+# and nothing is fetched from inside it.
+ext_fetch() {   # <name> <url> <sha256> -> path on stdout
+    local name="$1" url="$2" want="$3"
+    # The checksum is part of the file name, so a recipe that moves to another
+    # version lands beside the old file instead of colliding with it, and a
+    # cached file is by construction the one that was verified.
+    local out="${CACHE_DIR}/ext-${name}-${want:0:8}.tar.gz"
+    local got
+    if [[ -f "${out}" ]]; then
+        got="$(sha256sum "${out}" | awk '{print $1}')"
+        if [[ "${got}" = "${want}" ]]; then
+            printf '%s' "${out}"
+            return 0
+        fi
+        echo "  ${name}: the cached tarball does not match the recipe's checksum" >&2
+        if [[ "${SKIP_DOWNLOAD}" = true ]]; then
+            echo "ERROR: --no-download rules out fetching it again. Remove" >&2
+            echo "       ${out} and re-run without the flag." >&2
+            exit 1
+        fi
+        rm -f -- "${out}"
+    fi
+    if [[ "${SKIP_DOWNLOAD}" = true ]]; then
+        echo "ERROR: --no-download is set, but ${name} has not been fetched." >&2
+        echo "       Expected ${out}." >&2
+        exit 1
+    fi
+    echo "Downloading ${name}: ${url}" >&2
+    if ! curl -fSL --progress-bar -o "${out}" "${url}"; then
+        rm -f -- "${out}"
+        echo "ERROR: could not download ${url}" >&2
+        exit 1
+    fi
+    got="$(sha256sum "${out}" | awk '{print $1}')"
+    if [[ "${got}" != "${want}" ]]; then
+        echo "ERROR: ${name}: SHA256 mismatch" >&2
+        echo "  Expected: ${want}" >&2
+        echo "  Got:      ${got}" >&2
+        echo "  The recipe's EXT_SHA256 and EXT_URL disagree; one of them is" >&2
+        echo "  for a different release." >&2
+        rm -f -- "${out}"
+        exit 1
+    fi
+    printf '%s' "${out}"
+}
+
+# -- how the extension recipes reach the build -------------------------
+# One directory per extension, holding the recipe and its source tarball. That
+# shape is the same either way -- the real directory for a host build, a mount
+# point inside the container -- so bundle.sh has one thing to deal with and not
+# two, and the two names inside are fixed rather than derived.
+#
+# The directory is assembled in the cache rather than pointed at the caller's
+# file because a host build and a container build want different things from
+# the same inputs: the container cannot follow a symlink to a host path, and
+# mounting two files per extension to name them inside would put the naming
+# back in this script with a mount for each. A copy of a few megabytes is the
+# cheaper half of that trade.
+#
+# The list is newline separated, and that is not decoration: a space is legal
+# in a path (--cache-dir is the caller's to name), so a space-separated list
+# would silently split one, and LOCALES only gets away with it by being a
+# list of locale names.
+EXT_TRANSPORT=""
+EXT_MOUNT_ARGS=()
+if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
+    EXT_STAGE="${CACHE_DIR}/ext-stage"
+    rm -rf -- "${EXT_STAGE}"
+    mkdir -p -- "${EXT_STAGE}"
+    ext_paths=()
+    for ext_i in "${!EXT_RECIPES[@]}"; do
+        ext_name="${EXT_NAMES[ext_i]}"
+        IFS='|' read -r ext_url ext_sha _ext_deps _ext_desc <<<"${EXT_HEADERS[ext_i]}"
+        ext_tarball="$(ext_fetch "${ext_name}" "${ext_url}" "${ext_sha}")"
+
+        ext_dir="${EXT_STAGE}/${ext_i}"
+        mkdir -p -- "${ext_dir}"
+        cp -p -- "${EXT_RECIPES[ext_i]}" "${ext_dir}/${ext_name}.sh"
+        cp -p -- "${ext_tarball}" "${ext_dir}/src.tar.gz"
+
+        if [[ "${WITHOUT_CONTAINER}" = true ]]; then
+            ext_paths+=("${ext_dir}")
+        else
+            ext_paths+=("/ext/${ext_i}")
+            EXT_MOUNT_ARGS+=(-v "${ext_dir}:/ext/${ext_i}${SRC_MOUNT_OPTS}")
+        fi
+    done
+    EXT_TRANSPORT="$(printf '%s\n' "${ext_paths[@]}")"
+    unset ext_i ext_name ext_url ext_sha ext_tarball ext_dir ext_paths
+fi
+
 # -- build ------------------------------------------------------------
 case "${BUILD_MODE}" in
     client) OUT_SUFFIX="";      MODE_DESC="client tools only" ;;
@@ -949,7 +1270,7 @@ if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     # PG_HOST_BUILD tells it that a dependency meson cannot find is this file's
     # HOST_DEPS table rather than the Containerfile.
     SRC="${SRC_DIR}" OUT="${OUT_DIR}" PG_VERSION="${VERSION}" BUILD_MODE="${BUILD_MODE}" \
-        LOCALES="${LOCALES}" \
+        LOCALES="${LOCALES}" EXT_SPECS="${EXT_TRANSPORT}" \
         PG_HOST_BUILD=1 bash "${SCRIPT_DIR}/bundle.sh"
 else
     echo "=== Building image (${RUNTIME}) ==="
@@ -973,8 +1294,10 @@ else
         -e "PG_VERSION=${VERSION}" \
         -e "BUILD_MODE=${BUILD_MODE}" \
         -e "LOCALES=${LOCALES}" \
+        -e "EXT_SPECS=${EXT_TRANSPORT}" \
         -v "${SRC_DIR}:/src${SRC_MOUNT_OPTS}" \
         -v "${OUT_DIR}:/out${OUT_MOUNT_OPTS}" \
+        ${EXT_MOUNT_ARGS[@]+"${EXT_MOUNT_ARGS[@]}"} \
         pg18-builder
 fi
 
