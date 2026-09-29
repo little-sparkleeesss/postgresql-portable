@@ -64,6 +64,41 @@ if [[ "${BUILD_MODE}" = "full" ]]; then WITH_SERVER=true; fi
 
 echo "=== Building PostgreSQL ${PG_VERSION} portable bundle (${BUILD_MODE}: ${MODE_DESC}) ==="
 
+# -- Explain a meson failure (host builds) ------------------------------
+# meson stops at the first thing it cannot find. In a container build the fix
+# for that is a package in the Containerfile; on a host build (build.sh sets
+# PG_HOST_BUILD) it is a row in build.sh's HOST_DEPS table -- a connection
+# nothing in meson's own message makes. Dependencies a newer PostgreSQL release
+# introduces arrive here first, so say which file to open.
+report_missing_dep() {
+    [[ "${PG_HOST_BUILD:-0}" = "1" ]] || return 0
+    local log="${BUILDDIR}/build/meson-logs/meson-log.txt" why=""
+    # The last ERROR line is the fatal one. Its shape varies -- "Dependency
+    # \"icu-uc\" not found, tried pkgconfig" from meson, "Problem encountered:
+    # dependency lookup for gssapi failed" from PostgreSQL's own checks -- so
+    # quote it as it comes rather than pattern-matching a name out of it.
+    if [[ -f "${log}" ]]; then
+        why="$(grep -E 'ERROR:' "${log}" 2>/dev/null | tail -n 1 || true)"
+    fi
+    {
+        echo ""
+        echo "=== Host build: meson setup failed ==="
+        if [[ -n "${why}" ]]; then
+            echo "  ${why}"
+            echo ""
+        fi
+        echo "In a container build a missing dependency is a package in the"
+        echo "Containerfile. In a host build it is a row in build.sh's HOST_DEPS"
+        echo "table -- add one for the item above (the comment above the table"
+        echo "documents the columns and what a probe can be), or install it by hand"
+        echo "and re-run with --skip-deps. A dependency introduced by a newer"
+        echo "PostgreSQL release lands here first, and the Containerfile needs the"
+        echo "matching package for container builds."
+        echo ""
+        echo "meson's log: ${log}"
+    } >&2
+}
+
 # -- Build --------------------------------------------------------------
 if [[ "${SKIP_BUILD:-0}" = "1" && -f "${PREFIX}/bin/psql" ]]; then
     echo "=== SKIP_BUILD=1, using existing install at ${PREFIX} ==="
@@ -97,38 +132,46 @@ else
         --strip
     )
 
+    # The mode decides which features are asked for. Both modes end in the same
+    # meson call, so a failure has exactly one place where it is explained.
+    MODE_OPTS=()
     if [[ "${WITH_SERVER}" = true ]]; then
         echo "=== Mode: ${BUILD_MODE} (${MODE_DESC}), all server-side features enabled ==="
-        meson setup build \
-            "${COMMON_OPTS[@]}" \
-            -Dnls=enabled \
-            -Dplperl=enabled \
-            -Dplpython=enabled \
-            -Dpltcl=enabled \
-            -Ddtrace=auto \
-            -Dllvm=enabled \
-            -Dselinux=enabled \
-            -Dsystemd=enabled \
-            -Dicu=enabled \
-            -Dlibxslt=enabled \
+        MODE_OPTS=(
+            -Dnls=enabled
+            -Dplperl=enabled
+            -Dplpython=enabled
+            -Dpltcl=enabled
+            -Ddtrace=auto
+            -Dllvm=enabled
+            -Dselinux=enabled
+            -Dsystemd=enabled
+            -Dicu=enabled
+            -Dlibxslt=enabled
             -Duuid=e2fs
+        )
     else
         echo "=== Mode: client (client tools only, server-only features disabled) ==="
-        meson setup build \
-            "${COMMON_OPTS[@]}" \
-            -Dnls=disabled \
-            -Dplperl=disabled \
-            -Dplpython=disabled \
-            -Dpltcl=disabled \
-            -Ddtrace=disabled \
-            -Dllvm=disabled \
-            -Dselinux=disabled \
-            -Dsystemd=disabled \
-            -Dicu=disabled \
-            -Dlibxslt=disabled \
-            -Dlibnuma=disabled \
-            -Dliburing=disabled \
+        MODE_OPTS=(
+            -Dnls=disabled
+            -Dplperl=disabled
+            -Dplpython=disabled
+            -Dpltcl=disabled
+            -Ddtrace=disabled
+            -Dllvm=disabled
+            -Dselinux=disabled
+            -Dsystemd=disabled
+            -Dicu=disabled
+            -Dlibxslt=disabled
+            -Dlibnuma=disabled
+            -Dliburing=disabled
             -Duuid=none
+        )
+    fi
+
+    if ! meson setup build "${COMMON_OPTS[@]}" "${MODE_OPTS[@]}"; then
+        report_missing_dep
+        exit 1
     fi
 
 echo "=== Step 2: Compile ==="
@@ -437,13 +480,23 @@ if [[ "${WITH_SERVER}" = true ]]; then
 
     PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     PY_STDLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"
-    PY_PLATLIBDIR="$(python3 -c 'import sys; print(sys.platlibdir)')"
-    if [[ "${PY_PLATLIBDIR}" != "lib" ]]; then
-        echo "ERROR: python platlibdir is '${PY_PLATLIBDIR}', expected 'lib'" >&2
-        exit 1
-    fi
-    cp -r "${PY_STDLIB}" "${BUNDLE}/lib/python${PY_VER}"
-    echo "  python${PY_VER} <- ${PY_STDLIB}"
+    # CPython looks for its standard library under
+    # <prefix>/<platlibdir>/python<X.Y>, and that directory name is compiled
+    # into the interpreter: "lib" on Debian, "lib64" on Fedora and RHEL. The
+    # bundle keeps the host's name so that the bundled interpreter finds the
+    # bundled tree -- a Fedora-built bundle under lib/ would come up with no
+    # encodings module at all.
+    PY_LIBDIR="$(python3 -c 'import sys; print(sys.platlibdir)')"
+    case "${PY_LIBDIR}" in
+        lib|lib64) ;;
+        *)
+            echo "ERROR: python platlibdir is '${PY_LIBDIR}', expected lib or lib64" >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "${BUNDLE}/${PY_LIBDIR}"
+    cp -r "${PY_STDLIB}" "${BUNDLE}/${PY_LIBDIR}/python${PY_VER}"
+    echo "  ${PY_LIBDIR}/python${PY_VER} <- ${PY_STDLIB}"
 
     # Perl's @INC contains entries that cannot be derived from Config (Debian
     # ships /usr/share/perl/5.36.0 while privlib says /usr/share/perl/5.36), so
@@ -460,13 +513,18 @@ if [[ "${WITH_SERVER}" = true ]]; then
         [[ -n "${perl_seen[${d}]:-}" ]] && continue
         perl_seen["${d}"]=1
         dest="${BUNDLE}/lib/perl${d}"
-        mkdir -p "$(dirname "${dest}")"
+        # Copy the *contents* of the directory, not the directory itself. An
+        # @INC entry can be the parent of one that came before it -- Fedora
+        # lists /usr/share/perl5/vendor_perl and then /usr/share/perl5 -- and a
+        # plain "cp -r src dest" against the directory the earlier entry already
+        # created would nest the whole tree one level down, leaving strict.pm
+        # and every other core module out of the bundle.
+        mkdir -p "${dest}" "$(dirname "${dest}")"
         # -L: several of these entries are symlinks into a sibling versioned
         # directory (Debian ships /usr/share/perl/5.36 -> 5.36.0, but @INC only
         # names 5.36). Copying the link verbatim would leave it dangling and
         # silently drop every module underneath it.
-        # dest must not already exist, or cp would nest the tree one level down.
-        cp -aL "${d}" "${dest}"
+        cp -aL "${d}/." "${dest}/"
         PERL_INC_SUFFIXES+=("${d#/}")
         # Note the explicit per-line newline: "print join("\n", ...)" would
         # leave the last entry unterminated, and "while read" discards a final
@@ -497,14 +555,14 @@ if [[ "${WITH_SERVER}" = true ]]; then
     cp -r "${TCL_LIB}" "${BUNDLE}/lib/${TCL_VER}"
     echo "  ${TCL_VER} <- ${TCL_LIB}"
 
-    prune_links "${BUNDLE}/lib/python${PY_VER}"
+    prune_links "${BUNDLE}/${PY_LIBDIR}/python${PY_VER}"
     prune_links "${BUNDLE}/lib/perl"
     prune_links "${BUNDLE}/lib/${TCL_VER}"
 
     # The .so files inside these trees link against libssl, libcrypt, ... and
     # are outside every earlier scan.
     echo "  collecting dependencies of bundled interpreter modules"
-    add_deps $(find "${BUNDLE}/lib/python${PY_VER}" "${BUNDLE}/lib/perl" "${BUNDLE}/lib/${TCL_VER}" \
+    add_deps $(find "${BUNDLE}/${PY_LIBDIR}/python${PY_VER}" "${BUNDLE}/lib/perl" "${BUNDLE}/lib/${TCL_VER}" \
         -type f -name '*.so*' 2>/dev/null)
     flush_deps
 fi
@@ -575,8 +633,8 @@ if [[ "${WITH_SERVER}" = true ]]; then
     # wrapper gets these. Everything else stays free of them, which keeps a
     # host interpreter started via  \!  or COPY PROGRAM  from inheriting a
     # PYTHONHOME that points into the bundle.
-    # PYTHONHOME names the prefix containing lib/python@PY_VER@ -- not the
-    # standard library directory itself. Pointing it at the stdlib makes
+    # PYTHONHOME names the prefix containing @PY_LIBDIR@/python@PY_VER@ -- not
+    # the standard library directory itself. Pointing it at the stdlib makes
     # CPython fail to find encodings and abort during Py_Initialize().
     # Deliberately written with "if" rather than "&&": see the note about
     # patsub_replacement above.
@@ -584,7 +642,7 @@ if [[ "${WITH_SERVER}" = true ]]; then
 # The interpreter runtimes live inside the bundle. CPython and Tcl cannot
 # discover the prefix on their own here: /proc/self/exe points at the bundled
 # loader, not at this program.
-if [ -d "\$LIB_DIR/python@PY_VER@" ]; then PYTHONHOME=\$PREFIX_DIR; export PYTHONHOME; fi
+if [ -d "\$PREFIX_DIR/@PY_LIBDIR@/python@PY_VER@" ]; then PYTHONHOME=\$PREFIX_DIR; export PYTHONHOME; fi
 if [ -d "\$LIB_DIR/perl" ]; then
     PERL5LIB=
     for _inc in @PERL_INC@; do
@@ -595,6 +653,7 @@ fi
 if [ -d "\$LIB_DIR/@TCL_VER@" ]; then TCL_LIBRARY=\$LIB_DIR/@TCL_VER@; export TCL_LIBRARY; fi
 PLENV
 )"
+    PL_ENV_BLOCK="${PL_ENV_BLOCK//@PY_LIBDIR@/${PY_LIBDIR}}"
     PL_ENV_BLOCK="${PL_ENV_BLOCK//@PY_VER@/${PY_VER}}"
     PL_ENV_BLOCK="${PL_ENV_BLOCK//@PERL_INC@/${PERL_INC_LIST}}"
     PL_ENV_BLOCK="${PL_ENV_BLOCK//@TCL_VER@/${TCL_VER}}"

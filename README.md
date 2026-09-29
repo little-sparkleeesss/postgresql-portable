@@ -60,6 +60,7 @@ cd output/18.4-full
 - **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, LLVM, readline, zstd, …) is included, plus the glibc the binaries were built against
 - **Bundled interpreter runtimes** (`--full`) — the Python, Perl and Tcl runtimes that PL/Python, PL/Perl and PL/Tcl need
 - **Cross-distro** — runs on any x86_64 Linux with kernel ≥ 5.x (verified: Debian bookworm → Debian bookworm and Rocky Linux 9)
+- **Optional host build** (`--without-container`) — compile without a container runtime at all; what the toolchain is missing is probed for and installed through apt or dnf
 
 ## Requirements
 
@@ -69,6 +70,11 @@ cd output/18.4-full
 | curl | any |
 | bash | 4.x+ |
 | sha256sum | any (coreutils) |
+
+With `--without-container` no container runtime is needed; the build toolchain
+(gcc, meson, ninja, bison, flex, patchelf, the `-dev` packages of OpenSSL,
+Kerberos, LDAP, ICU, LLVM, …) is installed on the host instead, through apt
+(Debian, Ubuntu) or dnf (Fedora, RHEL, Rocky).
 
 ## Usage
 
@@ -96,6 +102,9 @@ cd output/18.4-full
 
 # Custom cache directory
 CACHE_DIR=/tmp/pg-cache ./build.sh 18.4
+
+# Build on this machine, installing whatever the toolchain is missing
+./build.sh 18.4 --full --without-container
 ```
 
 ### Options
@@ -105,9 +114,58 @@ CACHE_DIR=/tmp/pg-cache ./build.sh 18.4
 | `--full` | Build the client + server bundle (both tool sets) |
 | `--no-download` | Skip downloading; fail if tarball is not cached |
 | `--cache-dir DIR` | Set cache directory (default: `./cache`) |
+| `--without-container` | Compile on the host instead of in a container |
+| `--skip-deps` | With `--without-container`: report missing dependencies but install nothing |
+| `--yes` | Do not ask before installing packages |
 
 The container runtime is chosen automatically: `podman` if present, otherwise
 `docker`. Override with `CONTAINER_RUNTIME=podman|docker`.
+
+### Building on the host
+
+`--without-container` compiles in the working copy of the source tree and needs
+the same toolchain the `Containerfile` installs, so the build starts by probing
+the host for it. Only what is actually missing is installed, and the package
+list is shown with the exact command before anything runs — answer the prompt or
+pass `--yes`. Which package that is is left to the package manager rather than
+to a hardcoded name, so a distribution that renames, splits or merges a package
+still works.
+
+```
+=== Host build: checking build dependencies (dnf) ===
+  ldap        openldap-devel   (for lib:ldap:ldap.h)
+  zlib        zlib-ng-compat-devel   (for lib:zlib:zlib.h)
+  ...
+  perl-build  perl-FindBin perl-File-Basename perl-Getopt-Long perl-Scalar-List-Utils   (for fn:perl_build_mods)
+  perl-mods   perl-Opcode perl-ExtUtils-Embed perl-ExtUtils-ParseXS   (for fn:perl_mods)
+  ...
+  tclsh       tcl   (for cmd:tclsh,tclsh8.6,tclsh8.7)
+
+Install with:
+  sudo dnf install -y gcc meson ninja-build ... perl-FindBin ... tcl
+```
+
+On dnf the table names a *provide* — `pkgconfig(zlib)`, a header path, a binary
+path — and dnf resolves it to whichever package provides it today; on Debian
+that package is `zlib1g-dev`, on Fedora `zlib-ng-compat-devel`, and neither is
+written down anywhere. apt has no such index to search, so candidate names are
+tried against the package index and, when every one of them is gone, the index
+is searched for the closest `*-dev` name.
+
+Fedora splits core perl into one package per module, which is where that shows
+its teeth: PostgreSQL's build scripts need `FindBin` before a single file
+compiles, and Fedora keeps it in `perl-FindBin`, so a build that only installed
+"perl" dies minutes in with `Can't locate FindBin.pm in @INC`.
+
+Nothing is installed that the table does not know about. When meson stops on
+something it cannot find — which is how a dependency a newer PostgreSQL release
+brings with it shows up — the failure quotes meson's line and says that the
+answer is a row in that table (and, for container builds, a package in the
+`Containerfile`).
+
+A host build is a normal build otherwise: it produces the same bundle layout
+into `output/<version>[-full]`, built against the host's glibc rather
+than the build image's.
 
 ## Output
 
@@ -134,6 +192,10 @@ output/18.4-full/
     └── locale/                   ← NLS message catalogues
 ```
 
+The interpreter tree sits where its own interpreter looks for it: Python built
+with `platlibdir=lib64` (Fedora, RHEL) finds its standard library under
+`lib64/python3.11/`, so a bundle built there keeps that name rather than `lib/`.
+
 Sizes of an 18.4 build: `--full` is around 366 MB, most of it LLVM (104 MB),
 z3 (22 MB), ICU (33 MB) and the interpreter runtimes (110 MB — Python 54, Perl
 53, Tcl 3). The client bundle is around 24 MB: with the server-only features off
@@ -157,11 +219,14 @@ so a missing library fails loudly instead of silently picking up a host copy.
 ### build.sh (host side)
 
 1. Parses the version argument
-2. Downloads `postgresql-{version}.tar.bz2` and its `.sha256` from the official PostgreSQL FTP
-3. Verifies the checksum
-4. Extracts the source (cached for future runs)
-5. Builds the image from `Containerfile`
-6. Runs the container as the invoking user, with the source (read-only) and output directory mounted
+2. With `--without-container`: probes the host for the build toolchain and
+   installs what is missing (apt or dnf), then runs
+   `bundle.sh` directly on the working copy
+3. Downloads `postgresql-{version}.tar.bz2` and its `.sha256` from the official PostgreSQL FTP
+4. Verifies the checksum
+5. Extracts the source (cached for future runs)
+6. Builds the image from `Containerfile`
+7. Runs the container as the invoking user, with the source (read-only) and output directory mounted
 
 ### bundle.sh (inside the container)
 
