@@ -8,8 +8,8 @@ PG_FTP_BASE="https://ftp.postgresql.org/pub/source"
 # -- usage ------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 <version> [--full] [--no-download] [--cache-dir DIR]
-          [--without-container] [--skip-deps] [--yes]
+Usage: $0 <version> [--full] [--locales=LIST] [--no-download]
+          [--cache-dir DIR] [--without-container] [--skip-deps] [--yes]
 
 Modes:
   (default)   client tools      -> output/<version>
@@ -46,6 +46,17 @@ Neither half is crippled by the split: the one helper a client tool reaches
 across the line for is shipped with it. A client bundle therefore carries
 pg_waldump, which pg_verifybackup calls.
 
+Locales:
+  --locales=LIST       glibc locale data to carry besides C.UTF-8, which every
+                       bundle already has: comma separated names
+                       (zh_CN.UTF-8,en_US.UTF-8) or the word "all". Needs --full.
+                       This is what lets initdb --locale=zh_CN.UTF-8 work on a
+                       host that has no locales of its own. Up to about 3 MB
+                       each, roughly 230 MB for "all". Carrying any of them
+                       makes the launcher set LOCPATH, which switches off the
+                       host's locale-archive lookup -- read the README first if
+                       the target host keeps its locales there.
+
 Host build:
   --without-container  Compile on this machine instead of in a container. Needs
                        the same toolchain the Containerfile installs; what is
@@ -63,6 +74,8 @@ Examples:
   $0 18                   newest 18.x            -> output/18
   $0 18.4 --full          client + server bundle -> output/18.4-full
   $0 19beta1 --full       build PG 19 beta 1 (all features enabled)
+  $0 18.4 --full --locales=zh_CN.UTF-8,en_US.UTF-8   carry two locales
+  $0 18.4 --full --locales=all                       carry every locale
   $0 18.4 --no-download   skip download, use existing cache
   $0 /path/to/pg-src      build from local source tree
   $0 18.4 --without-container   build on this host, installing what is missing
@@ -79,6 +92,8 @@ VERSION=""
 WITHOUT_CONTAINER=false
 SKIP_DEPS=false
 ASSUME_YES=false
+LOCALES=""
+LOCALES_GIVEN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -100,6 +115,16 @@ while [[ $# -gt 0 ]]; do
         --cache-dir)
             CACHE_DIR="$2"
             shift 2
+            ;;
+        --locales)
+            LOCALES="$2"
+            LOCALES_GIVEN=true
+            shift 2
+            ;;
+        --locales=*)
+            LOCALES="${1#*=}"
+            LOCALES_GIVEN=true
+            shift
             ;;
         --without-container)
             WITHOUT_CONTAINER=true
@@ -130,6 +155,54 @@ done
 if [[ -z "${VERSION}" ]]; then
     echo "ERROR: version argument is required"
     usage
+fi
+
+# -- validate --locales -----------------------------------------------
+# Each name ends up as a directory inside the bundle, and the container writes
+# to the bundle through a bind mount, so a name carrying a slash or ".." would
+# put files into the caller's own output tree. Check it here rather than trust
+# the shell quirk of the moment; bundle.sh checks it again because the image's
+# entrypoint can be run directly, without this script.
+validate_locales() {
+    local list="$1" name
+    [[ -n "${list}" ]] || return 0
+    if [[ "${list}" = "all" ]]; then return 0; fi
+    if [[ ",${list}," = *",all,"* ]]; then
+        echo "ERROR: --locales=all cannot be combined with named locales." >&2
+        exit 1
+    fi
+    local -a names
+    IFS=',' read -ra names <<<"${list}"
+    for name in "${names[@]}"; do
+        # The allowed-character test alone would still pass "." and ".." and a
+        # leading "-", so those are named separately.
+        case "${name}" in
+            ""|.|..|-*|.*)
+                echo "ERROR: --locales: '${name}' is not a usable locale name." >&2
+                exit 1
+                ;;
+        esac
+        if [[ ! "${name}" =~ ^[A-Za-z0-9_@.-]+$ ]]; then
+            echo "ERROR: --locales: '${name}' contains characters that cannot" >&2
+            echo "       appear in a locale name (allowed: A-Za-z0-9 _ @ . -)." >&2
+            exit 1
+        fi
+    done
+}
+
+if [[ "${LOCALES_GIVEN}" = true ]]; then
+    if [[ -z "${LOCALES}" ]]; then
+        echo "ERROR: --locales needs a value, e.g. --locales=zh_CN.UTF-8" >&2
+        echo "       or --locales=all." >&2
+        exit 1
+    fi
+    validate_locales "${LOCALES}"
+    if [[ "${BUILD_MODE}" = "client" ]]; then
+        echo "ERROR: --locales needs --full. The locale data lives in the server" >&2
+        echo "       payload, and a client build also has PostgreSQL's own message" >&2
+        echo "       catalogues compiled out, so there would be nothing to read it." >&2
+        exit 1
+    fi
 fi
 
 # Whether the source has to be fetched over the network decides if curl counts
@@ -168,8 +241,15 @@ fi
 #   modes  all      - every build
 #          server   - server payload only (--full)
 #          download - only when the source has to be fetched
+#          locales  - only when --locales named something other than "all"
+#          locales-all - only with --locales=all
 #          A row is used when any of its modes is active. A client build
 #          therefore never pulls in LLVM or the interpreter runtimes.
+#
+#          The two locale modes are separate because the capability is not the
+#          same one: a machine with one langpack can serve a named locale but
+#          cannot serve "all", and the package that carries everything is not
+#          the package that carries one language.
 #
 #   probe  cmd:  command in PATH (comma separated alternatives)
 #          hdr:  header file under the usual include roots
@@ -184,45 +264,47 @@ fi
 #          built, while Debian has all three in perl itself.
 #
 read -r -d '' HOST_DEPS <<'EOF' || true
-# id        | modes    | probe                                  | dnf provides                                               | apt candidates
-cc          | all      | cmd:cc                                 | /usr/bin/cc                                                | build-essential gcc
-meson       | all      | cmd:meson                              | /usr/bin/meson                                             | meson
-ninja       | all      | cmd:ninja                              | /usr/bin/ninja                                             | ninja-build
-pkgconf     | all      | cmd:pkg-config                         | /usr/bin/pkg-config                                        | pkgconf pkg-config
-bison       | all      | cmd:bison                              | /usr/bin/bison                                             | bison
-flex        | all      | cmd:flex                               | /usr/bin/flex                                              | flex
-perl        | all      | cmd:perl                               | /usr/bin/perl                                              | perl
-binutils    | all      | cmd:ldd                                | /usr/bin/ldd                                               | binutils
-patchelf    | all      | cmd:patchelf                           | /usr/bin/patchelf                                          | patchelf
-file        | all      | cmd:file                               | /usr/bin/file                                              | file
-curl        | download | cmd:curl                               | /usr/bin/curl                                              | curl
-readline    | all      | lib:readline:readline/readline.h       | pkgconfig(readline)                                        | libreadline-dev
-openssl     | all      | lib:openssl:openssl/ssl.h              | pkgconfig(openssl)                                         | libssl-dev
-krb5        | all      | lib:krb5-gssapi:gssapi/gssapi.h        | pkgconfig(krb5-gssapi)                                     | libkrb5-dev
-ldap        | all      | lib:ldap:ldap.h                        | pkgconfig(ldap)                                            | libldap2-dev libldap-dev
-pam         | all      | hdr:security/pam_appl.h                | /usr/include/security/pam_appl.h                           | libpam0g-dev libpam-dev
-zlib        | all      | lib:zlib:zlib.h                        | pkgconfig(zlib)                                            | zlib1g-dev
-lz4         | all      | lib:liblz4:lz4.h                       | pkgconfig(liblz4)                                          | liblz4-dev
-zstd        | all      | lib:libzstd:zstd.h                     | pkgconfig(libzstd)                                         | libzstd-dev
-libcurl     | all      | lib:libcurl:curl/curl.h                | pkgconfig(libcurl)                                         | libcurl4-openssl-dev libcurl4-gnutls-dev
-xml2        | all      | lib:libxml-2.0:libxml2/libxml/parser.h | pkgconfig(libxml-2.0)                                      | libxml2-dev
-icu         | server   | lib:icu-uc,icu-i18n:unicode/utypes.h   | pkgconfig(icu-uc)                                          | libicu-dev
-xslt        | server   | lib:libxslt:libxslt/xslt.h             | pkgconfig(libxslt)                                         | libxslt1-dev
-llvm        | server   | cmd:llvm-config                        | /usr/bin/llvm-config                                       | llvm-dev
-clang       | server   | cmd:clang                              | /usr/bin/clang                                             | clang
-systemd     | server   | lib:libsystemd:systemd/sd-daemon.h     | pkgconfig(libsystemd)                                      | libsystemd-dev
-selinux     | server   | lib:libselinux:selinux/selinux.h       | pkgconfig(libselinux)                                      | libselinux1-dev
-uuid        | server   | lib:uuid:uuid/uuid.h                   | pkgconfig(uuid)                                            | uuid-dev libuuid1-dev
-numa        | server   | lib:numa:numa.h                        | pkgconfig(numa)                                            | libnuma-dev
-uring       | server   | lib:liburing:liburing.h                | pkgconfig(liburing)                                        | liburing-dev
-sdt         | server   | hdr:sys/sdt.h                          | /usr/include/sys/sdt.h                                     | systemtap-sdt-dev
-gettext     | server   | cmd:msgfmt                             | /usr/bin/msgfmt                                            | gettext
-perl-build  | all      | fn:perl_build_mods                     | perl(FindBin)+perl(File::Basename)+perl(Getopt::Long)+perl(List::Util) | perl
-perl-dev    | server   | fn:perl_dev                            | */CORE/perl.h                                              | libperl-dev
-perl-mods   | server   | fn:perl_mods                           | perl(Opcode)+perl(ExtUtils::Embed)+perl(ExtUtils::ParseXS) | perl
-python-dev  | server   | fn:python_dev                          | pkgconfig(python3-embed)                                   | python3-dev
-tcl-dev     | server   | fn:tcl_dev                             | pkgconfig(tcl)                                             | tcl-dev
-tclsh       | server   | cmd:tclsh,tclsh8.6,tclsh8.7            | /usr/bin/tclsh                                             | tcl
+# id        | modes       | probe                                  | dnf provides                                                           | apt candidates
+cc          | all         | cmd:cc                                 | /usr/bin/cc                                                            | build-essential gcc
+meson       | all         | cmd:meson                              | /usr/bin/meson                                                         | meson
+ninja       | all         | cmd:ninja                              | /usr/bin/ninja                                                         | ninja-build
+pkgconf     | all         | cmd:pkg-config                         | /usr/bin/pkg-config                                                    | pkgconf pkg-config
+bison       | all         | cmd:bison                              | /usr/bin/bison                                                         | bison
+flex        | all         | cmd:flex                               | /usr/bin/flex                                                          | flex
+perl        | all         | cmd:perl                               | /usr/bin/perl                                                          | perl
+binutils    | all         | cmd:ldd                                | /usr/bin/ldd                                                           | binutils
+patchelf    | all         | cmd:patchelf                           | /usr/bin/patchelf                                                      | patchelf
+file        | all         | cmd:file                               | /usr/bin/file                                                          | file
+curl        | download    | cmd:curl                               | /usr/bin/curl                                                          | curl
+readline    | all         | lib:readline:readline/readline.h       | pkgconfig(readline)                                                    | libreadline-dev
+openssl     | all         | lib:openssl:openssl/ssl.h              | pkgconfig(openssl)                                                     | libssl-dev
+krb5        | all         | lib:krb5-gssapi:gssapi/gssapi.h        | pkgconfig(krb5-gssapi)                                                 | libkrb5-dev
+ldap        | all         | lib:ldap:ldap.h                        | pkgconfig(ldap)                                                        | libldap2-dev libldap-dev
+pam         | all         | hdr:security/pam_appl.h                | /usr/include/security/pam_appl.h                                       | libpam0g-dev libpam-dev
+zlib        | all         | lib:zlib:zlib.h                        | pkgconfig(zlib)                                                        | zlib1g-dev
+lz4         | all         | lib:liblz4:lz4.h                       | pkgconfig(liblz4)                                                      | liblz4-dev
+zstd        | all         | lib:libzstd:zstd.h                     | pkgconfig(libzstd)                                                     | libzstd-dev
+libcurl     | all         | lib:libcurl:curl/curl.h                | pkgconfig(libcurl)                                                     | libcurl4-openssl-dev libcurl4-gnutls-dev
+xml2        | all         | lib:libxml-2.0:libxml2/libxml/parser.h | pkgconfig(libxml-2.0)                                                  | libxml2-dev
+icu         | server      | lib:icu-uc,icu-i18n:unicode/utypes.h   | pkgconfig(icu-uc)                                                      | libicu-dev
+xslt        | server      | lib:libxslt:libxslt/xslt.h             | pkgconfig(libxslt)                                                     | libxslt1-dev
+llvm        | server      | cmd:llvm-config                        | /usr/bin/llvm-config                                                   | llvm-dev
+clang       | server      | cmd:clang                              | /usr/bin/clang                                                         | clang
+systemd     | server      | lib:libsystemd:systemd/sd-daemon.h     | pkgconfig(libsystemd)                                                  | libsystemd-dev
+selinux     | server      | lib:libselinux:selinux/selinux.h       | pkgconfig(libselinux)                                                  | libselinux1-dev
+uuid        | server      | lib:uuid:uuid/uuid.h                   | pkgconfig(uuid)                                                        | uuid-dev libuuid1-dev
+numa        | server      | lib:numa:numa.h                        | pkgconfig(numa)                                                        | libnuma-dev
+uring       | server      | lib:liburing:liburing.h                | pkgconfig(liburing)                                                    | liburing-dev
+sdt         | server      | hdr:sys/sdt.h                          | /usr/include/sys/sdt.h                                                 | systemtap-sdt-dev
+gettext     | server      | cmd:msgfmt                             | /usr/bin/msgfmt                                                        | gettext
+perl-build  | all         | fn:perl_build_mods                     | perl(FindBin)+perl(File::Basename)+perl(Getopt::Long)+perl(List::Util) | perl
+perl-dev    | server      | fn:perl_dev                            | */CORE/perl.h                                                          | libperl-dev
+perl-mods   | server      | fn:perl_mods                           | perl(Opcode)+perl(ExtUtils::Embed)+perl(ExtUtils::ParseXS)             | perl
+python-dev  | server      | fn:python_dev                          | pkgconfig(python3-embed)                                               | python3-dev
+tcl-dev     | server      | fn:tcl_dev                             | pkgconfig(tcl)                                                         | tcl-dev
+tclsh       | server      | cmd:tclsh,tclsh8.6,tclsh8.7            | /usr/bin/tclsh                                                         | tcl
+locales     | locales     | fn:locale_data                         | /usr/lib/locale/locale-archive                                         | locales locales-all
+locales-all | locales-all | fn:locale_all                          | /usr/lib/locale/locale-archive                                         | locales-all
 EOF
 
 # -- capability probes ------------------------------------------------
@@ -324,6 +406,37 @@ probe_tcl_dev() {
         if compgen -G "${d}/tcl[0-9]*/tclConfig.sh" >/dev/null; then return 0; fi
     done
     return 1
+}
+
+probe_locale_data() {
+    # "Can this machine produce a named locale other than C.utf8?" Either a
+    # prebuilt directory (Debian's locales-all, Fedora's glibc-langpack-*) or
+    # the source definitions localedef needs (Debian's locales package).
+    # An existing /usr/share/i18n/locales proves nothing -- Fedora ships the
+    # directory empty and keeps its data in langpacks -- so it has to have
+    # something in it, and the same goes for the locale directory scan.
+    local d
+    for d in /usr/lib/locale/*/; do
+        [[ -d "${d}" ]] || continue
+        case "${d}" in
+            */C.utf8/|*/C.UTF-8/) continue ;;
+        esac
+        return 0
+    done
+    compgen -G '/usr/share/i18n/locales/*' >/dev/null 2>&1
+}
+
+probe_locale_all() {
+    # The distribution's "every locale" package. On Fedora and RHEL that is
+    # glibc-all-langpacks, which appears as the single locale-archive file; on
+    # Debian it is locales-all, which appears as several hundred directories.
+    # The count below is a heuristic and not a test -- nothing marks a locale
+    # set as complete -- so it is set far above what one langpack provides, to
+    # make a host that has a single language still get the package installed.
+    if [[ -e /usr/lib/locale/locale-archive ]]; then return 0; fi
+    local n
+    n="$(find /usr/lib/locale -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    [[ "${n}" -ge 50 ]]
 }
 
 dep_probe() {   # probe spec -> 0 when the capability is present
@@ -464,6 +577,13 @@ provision_host_deps() {
     fi
     if [[ "${NEEDS_DOWNLOAD}" = true ]]; then
         active_modes="${active_modes}download "
+    fi
+    if [[ -n "${LOCALES}" ]]; then
+        if [[ "${LOCALES}" = "all" ]]; then
+            active_modes="${active_modes}locales-all "
+        else
+            active_modes="${active_modes}locales "
+        fi
     fi
 
     echo "=== Host build: checking build dependencies (${family}) ==="
@@ -829,6 +949,7 @@ if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     # PG_HOST_BUILD tells it that a dependency meson cannot find is this file's
     # HOST_DEPS table rather than the Containerfile.
     SRC="${SRC_DIR}" OUT="${OUT_DIR}" PG_VERSION="${VERSION}" BUILD_MODE="${BUILD_MODE}" \
+        LOCALES="${LOCALES}" \
         PG_HOST_BUILD=1 bash "${SCRIPT_DIR}/bundle.sh"
 else
     echo "=== Building image (${RUNTIME}) ==="
@@ -851,6 +972,7 @@ else
         -e "HOME=/tmp" \
         -e "PG_VERSION=${VERSION}" \
         -e "BUILD_MODE=${BUILD_MODE}" \
+        -e "LOCALES=${LOCALES}" \
         -v "${SRC_DIR}:/src${SRC_MOUNT_OPTS}" \
         -v "${OUT_DIR}:/out${OUT_MOUNT_OPTS}" \
         pg18-builder
@@ -874,6 +996,10 @@ case "${BUILD_MODE}" in
     full)
         echo "Initialize a data directory with:"
         echo "  ${OUT_DIR}/bin/initdb -D /path/to/pgdata --locale=C.UTF-8 -U postgres"
+        if [[ -n "${LOCALES}" ]]; then
+            echo "(this bundle also carries: ${LOCALES} -- any of those can be"
+            echo " passed to initdb --locale instead)"
+        fi
         echo "Start it with:"
         echo "  ${OUT_DIR}/bin/pg_ctl -D /path/to/pgdata -l /tmp/pg.log -o \"-p 5433 -k /tmp\" start"
         echo "Connect with:"

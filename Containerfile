@@ -49,6 +49,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # comes from tcl8.6 and is what bundle.sh uses to locate the Tcl script
     # library (/usr/share/tcltk/tcl8.6, shipped by libtcl8.6).
     tcl8.6 \
+    # Prebuilt glibc locale data, for --locales. The base image ships only
+    # /usr/lib/locale/C.utf8, which is not enough to run
+    # initdb --locale=zh_CN.UTF-8 on a host that has no locales of its own.
+    # locales-all carries every locale as a directory under /usr/lib/locale,
+    # which is the shape bundle.sh copies from; the much smaller `locales`
+    # package carries definitions for localedef instead, and is what a host
+    # build gets, since it does not need the whole set up front. Costs ~222 MB
+    # in this image and nothing in the bundles, except for the locales that
+    # --locales actually asks for.
+    locales-all \
     && rm -rf /var/lib/apt/lists/*
 
 COPY bundle.sh /bundle.sh

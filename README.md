@@ -59,6 +59,7 @@ cd output/18.4-full
 - **Source caching** — downloaded tarballs and extracted sources are reused across builds
 - **Bundled libraries** — every shared library the binaries load (OpenSSL, Kerberos, LDAP, ICU, LLVM, readline, zstd, …) is included, plus the glibc the binaries were built against
 - **Bundled interpreter runtimes** (`--full`) — the Python, Perl and Tcl runtimes that PL/Python, PL/Perl and PL/Tcl need
+- **Selectable locales** (`--locales`) — carry the glibc locale data for the languages you need, so `initdb --locale=zh_CN.UTF-8` works on a host that has no locales of its own
 - **Cross-distro** — runs on any x86_64 Linux with kernel ≥ 5.x (verified: Debian bookworm → Debian bookworm and Rocky Linux 9)
 - **Optional host build** (`--without-container`) — compile without a container runtime at all; what the toolchain is missing is probed for and installed through apt or dnf
 
@@ -93,6 +94,9 @@ Kerberos, LDAP, ICU, LLVM, …) is installed on the host instead, through apt
 
 # Client + server bundle, all features enabled
 ./build.sh 18.4 --full
+
+# …and able to run initdb --locale=zh_CN.UTF-8 on a host that has no locales
+./build.sh 18.4 --full --locales=zh_CN.UTF-8,en_US.UTF-8
 
 # Beta / RC
 ./build.sh 19beta1 --full
@@ -146,6 +150,7 @@ upstream has.
 | Option | Description |
 |--------|-------------|
 | `--full` | Build the client + server bundle (both tool sets) |
+| `--locales=LIST` | Carry these glibc locales besides `C.UTF-8`: comma separated names, or `all`. Needs `--full` |
 | `--no-download` | Skip downloading; fail if tarball is not cached |
 | `--cache-dir DIR` | Set cache directory (default: `./cache`) |
 | `--without-container` | Compile on the host instead of in a container |
@@ -154,6 +159,42 @@ upstream has.
 
 The container runtime is chosen automatically: `podman` if present, otherwise
 `docker`. Override with `CONTAINER_RUNTIME=podman|docker`.
+
+### Locales
+
+`--locales` decides which glibc locale *data* the bundle carries, on top of the
+`C.UTF-8` that every `--full` bundle already has. That is a different thing from
+the message catalogues under `share/locale`, which translate PostgreSQL's own
+output and are always complete.
+
+| Value | Effect | Cost |
+|-------|--------|------|
+| *(omitted)* | `C.UTF-8` only, as before | — |
+| `--locales=zh_CN.UTF-8,en_US.UTF-8` | those locales | about 0.4–3 MB each |
+| `--locales=all` | every locale the build image has | about 230 MB |
+
+Without it, `initdb --locale=zh_CN.UTF-8` fails on a bare host with `invalid
+locale name`; with it, the locale comes from the bundle. Two things worth
+knowing before using it:
+
+- **The launcher then sets `LOCPATH`.** glibc searches `LOCPATH` *in addition to*
+  its own directory, but it consults a `locale-archive` only when `LOCPATH` is
+  unset — so on a host that keeps its locales in an archive, those stop being
+  visible. The server note below spells that out; it is the one real cost.
+- **`all` means "whatever the build image has"**, so a bundle built on Debian and
+  one built on Rocky do not carry quite the same set.
+
+The data comes from the build image, where `locales-all` ships each locale as a
+directory under `/usr/lib/locale`. Those directories are largely symlinks into
+*each other* — Debian's `zh_CN.utf8` points eight of its twelve categories at
+`yue_HK`, `bo_CN`, `ug_CN`, `aa_DJ.utf8` and `cmn_TW` — so a locale named on the
+command line is copied with its links resolved: a link into a locale that was not
+asked for would otherwise dangle. `all` keeps the links, because there the whole
+set is present for them to resolve against.
+
+Host builds need the same data. `locales-all` provides it; so does the much
+smaller `locales` package, whose definitions `bundle.sh` compiles with
+`localedef` instead of copying.
 
 ### Building on the host
 
@@ -219,6 +260,8 @@ output/18.4-full/
 │   ├── perl/                     ← Perl's @INC trees, mirrored by absolute path
 │   ├── tcl8.6/                   ← Tcl script library
 │   ├── locale/C.utf8/            ← glibc locale data (LOCPATH), not NLS
+│   ├── locale/zh_CN.utf8/        ← …and any others --locales asked for,
+│   │                                under the folded name glibc looks up
 │   └── postgresql/               ← loadable modules: plpgsql, plperl, plpython3,
 │                                    pltcl, llvmjit, all contrib extensions
 └── share/
@@ -236,7 +279,10 @@ z3 (22 MB), ICU (33 MB) and the interpreter runtimes (110 MB — Python 54, Perl
 there is no LLVM, no ICU and no interpreter runtime to carry, and nothing below
 `share/` or `lib/postgresql/` is needed by a client tool. `--full` enables every
 optional feature; if size matters more than JIT or PL/Python, those are the
-knobs to turn off in `bundle.sh`.
+knobs to turn off in `bundle.sh`. `--locales` adds to whatever was built: about
+1–3 MB per locale, or roughly 230 MB for `all`, which is most of a bundle's worth
+again. The build image grows by about 220 MB either way, since it holds the data
+the bundles are cut from.
 
 Every executable is a small `/bin/sh` wrapper that `exec`s the real binary
 through the bundled dynamic linker:
@@ -281,7 +327,8 @@ so a missing library fails loudly instead of silently picking up a host copy.
    `libkrb5`, `libsasl2`, …). Added the same way are the `libnss_*.so.2` modules
    glibc `dlopen()`s by name and the `.so` files inside the interpreter trees
 5. Copies the server payload (`--full`): loadable modules,
-   `share/postgresql`, `share/locale`, the interpreter runtimes, and the glibc
+   `share/postgresql`, `share/locale`, the interpreter runtimes, the locales
+   `--locales` asked for, and the glibc
    locale data for `C.UTF-8`
 6. `patchelf --set-rpath` on everything except glibc itself, the loader and the NSS
    modules; rebuilds SONAME symlinks
@@ -310,12 +357,24 @@ This makes two things load-bearing:
 
 - **PostgreSQL refuses to run as root.** `initdb` and `postgres` must run as an
   ordinary user, and the data directory must be owned by that user.
-- **Pass `--locale=C.UTF-8` to `initdb`.** `--full` carries that locale's data
-  (`lib/locale/C.utf8`) and the launcher points `LOCPATH` at it,
-  but only on a host that has no `/usr/lib/locale/C.utf8` of its own — because
-  setting `LOCPATH` also switches off the `locale-archive` lookup, and a host
-  that ships the locale does not deserve to lose it. Other locales come from the
-  host, so a bare host resolves only `C`, `POSIX` and the bundled `C.UTF-8`.
+- **`initdb --locale=C.UTF-8` works everywhere; anything else needs `--locales`.**
+  `--full` carries `C.UTF-8` (`lib/locale/C.utf8`) and the launcher points
+  `LOCPATH` at it, but only on a host with no `/usr/lib/locale/C.utf8` of its
+  own, so that a host which has one keeps its own. Every other locale comes from
+  the host, and a bare host resolves only `C`, `POSIX` and the bundled
+  `C.UTF-8` — which is why `initdb --locale=zh_CN.UTF-8` fails there. Build with
+  `--locales=zh_CN.UTF-8` to carry it. See *Locales* below.
+- **A bundle built with `--locales` takes over the locale path.** Its launcher
+  sets `LOCPATH=<bundle>/lib/locale:/usr/lib/locale`, and glibc consults a
+  `locale-archive` **only** when `LOCPATH` is unset (`locale/findlocale.c`: it
+  tries the archive only if there was no LOCPATH). So on a host that keeps its
+  locales in an archive — RHEL-family machines with `glibc-all-langpacks`, a
+  Debian that has run `locale-gen` — every locale that lives only in that
+  archive stops resolving for processes started through the wrapper, including
+  the ones the server forks, and including locales the bundle was not asked to
+  carry. Per-locale directories under `/usr/lib/locale` keep working; that path
+  is named in `LOCPATH` for that reason. Nothing changes for a bundle built
+  without `--locales`.
 - **The default socket directory is `/tmp`** (compiled into PostgreSQL). On a
   shared machine use `-k` to point at a private directory.
 - **Do not symlink the files in `bin/` elsewhere.** The wrapper resolves its own
@@ -358,9 +417,16 @@ Some things are host policy by nature, and bundling them would be wrong:
 - **`/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`** — identity stays the
   host's business. The NSS *modules* are bundled, the lookup order is not.
 - **`/etc/hosts`, `/etc/resolv.conf`** — name resolution.
-- **Locale data other than `C.UTF-8`** — the bundle carries the one locale
-  `initdb` needs to run anywhere (see the server notes), and reads the rest from
-  the host, the way a native installation does.
+- **Locale data other than `C.UTF-8`** — unless `--locales` was given, the bundle
+  carries the one locale `initdb` needs to run anywhere (see the server notes)
+  and reads the rest from the host, the way a native installation does. With
+  `--locales` it carries the ones asked for; it does not become independent of
+  the host's locale data, it stops depending on it for those.
+- **The host's `locale-archive`** — a bundle built with `--locales` sets
+  `LOCPATH`, and glibc then ignores a locale-archive completely. Locales that
+  exist only there are not available to the bundle's processes. This is a
+  property of glibc, not of the bundle, and it is why the launcher only takes
+  the locale path when it has something to put there.
 - **`/etc/ssl/certs`** — trust anchors must be the host's, or they would never
   be updated.
 - **PAM** — `libpam.so.0` is bundled, but `pam_*.so` modules and `/etc/pam.d/*`

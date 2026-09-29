@@ -5,6 +5,13 @@ SRC="${SRC:-/src}"
 OUT="${OUT:-/out}"
 PG_VERSION="${PG_VERSION:-unknown}"
 BUILD_MODE="${BUILD_MODE:-client}"
+LOCALES="${LOCALES:-}"
+# Locales actually copied into the bundle, as opposed to the ones asked for.
+# The launcher's behaviour is decided by this list and not by LOCALES: the
+# request can name a locale the build could not find, and a client build never
+# copies any, yet neither case should produce a launcher that points LOCPATH at
+# a directory which is not there.
+bundled_locales=()
 PREFIX="/tmp/pg-install"
 BUILDDIR="/tmp/pgsrc"
 BUNDLE="${OUT}"
@@ -61,6 +68,16 @@ esac
 # every server-side feature, the client build leaves them all off.
 WITH_SERVER=false
 if [[ "${BUILD_MODE}" = "full" ]]; then WITH_SERVER=true; fi
+
+# The image's entrypoint is bundle.sh, so LOCALES can arrive without build.sh
+# having seen it. build.sh refuses this combination too; here it is the copy
+# that would otherwise write locale data into a bundle that has no server to
+# read it.
+if [[ -n "${LOCALES}" && "${WITH_SERVER}" = false ]]; then
+    echo "ERROR: LOCALES is set but this is a client build. The locale data" >&2
+    echo "       belongs to the server payload; build with BUILD_MODE=full." >&2
+    exit 1
+fi
 
 echo "=== Building PostgreSQL ${PG_VERSION} portable bundle (${BUILD_MODE}: ${MODE_DESC}) ==="
 
@@ -461,6 +478,150 @@ if [[ "${WITH_SERVER}" = true ]]; then
         echo "           initdb --locale=C.UTF-8 will need host locale data" >&2
     fi
 
+    # -- Extra locales (--locales) -------------------------------------
+    # Everything above is what a bundle carries by default. LOCALES names the
+    # rest, and each one has to be resolved before it can be copied: glibc
+    # folds a codeset to lower case and drops its punctuation
+    # (_nl_normalize_codeset), so "zh_CN.UTF-8" is the directory "zh_CN.utf8"
+    # and "ISO-8859-15" is "iso885915". A name that is already folded matches
+    # as it is; the folding is for the ones that are not.
+    normalize_locale_name() {   # <name> -> folded form on stdout
+        local n="$1" lang="${1%%.*}" codeset="${1#*.}"
+        [[ "${codeset}" = "${n}" ]] && { printf '%s' "${n}"; return 0; }
+        codeset="$(printf '%s' "${codeset}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')"
+        printf '%s.%s' "${lang}" "${codeset}"
+    }
+
+    lift_locale() {   # <requested> -> source directory on stdout, empty if none
+        local want="$1" d base
+        for d in /usr/lib/locale/*/; do
+            [[ -d "${d}" ]] || continue
+            base="$(basename "${d}")"
+            if [[ "${base}" = "${want}" ]]; then printf '%s' "${d%/}"; return 0; fi
+        done
+        want="$(normalize_locale_name "${want}")"
+        for d in /usr/lib/locale/*/; do
+            [[ -d "${d}" ]] || continue
+            base="$(basename "${d}")"
+            if [[ "$(normalize_locale_name "${base}")" = "${want}" ]]; then
+                printf '%s' "${d%/}"
+                return 0
+            fi
+        done
+        return 0
+    }
+
+    if [[ -n "${LOCALES}" ]]; then
+        echo "=== Step 11b2: Bundle extra locales (${LOCALES}) ==="
+
+        # The names arrive from the command line and end up as directories under
+        # a bind-mounted /out. build.sh vets them too; this is the copy that has
+        # to be safe on its own, because the image entrypoint can be run without
+        # build.sh. A name that is empty, "all" is handled separately, or
+        # carries a separator or a leading dot is refused outright.
+        for want in ${LOCALES//,/ }; do
+            case "${want}" in
+                ""|.|..|-*|.*|*/*)
+                    echo "ERROR: refusing locale name '${want}'" >&2
+                    exit 1
+                    ;;
+            esac
+        done
+
+        if [[ "${LOCALES}" = "all" ]]; then
+            # Copy every locale the build image has. The set therefore follows
+            # the image rather than a list written down here, and a bundle built
+            # on Debian will not carry quite the same set as one built on Rocky.
+            # Symbolic links are kept: unlike a single named locale below, the
+            # whole set is present, so the links between its members resolve.
+            shopt -s nullglob
+            for d in /usr/lib/locale/*/; do
+                base="$(basename "${d}")"
+                [[ "${base}" = "locale-archive" ]] && continue
+                [[ "${base}" = "C.utf8" ]] && continue   # already copied above
+                cp -r --preserve=mode,links "${d%/}" "${BUNDLE}/lib/locale/"
+                bundled_locales+=("${base}")
+            done
+            shopt -u nullglob
+            echo "  ${#bundled_locales[@]} locales, $(du -sh "${BUNDLE}/lib/locale" | cut -f1) total"
+        else
+            for want in ${LOCALES//,/ }; do
+                base="$(normalize_locale_name "${want}")"
+                src="$(lift_locale "${want}")"
+                if [[ -z "${src}" ]]; then
+                    # Nothing prebuilt to copy. Compile it instead, which is what
+                    # Debian's `locales` package is for: it ships the definitions
+                    # under /usr/share/i18n, and localedef turns one into exactly
+                    # the directory layout the copy above would have produced --
+                    # with no cross-locale links, since it writes every category.
+                    # Fedora has no definitions at all (its data arrives prebuilt
+                    # in glibc-langpack-*), so there the copy is the only route.
+                    lang="${want%%.*}"
+                    charset="${want#*.}"
+                    [[ "${charset}" = "${want}" ]] && charset="UTF-8"
+                    if [[ ! -f "/usr/share/i18n/locales/${lang}" ]]; then
+                        echo "ERROR: locale '${want}' can be neither copied nor" >&2
+                        echo "       compiled here." >&2
+                        echo "       Not under /usr/lib/locale, by that name or its" >&2
+                        echo "       folded form, and the definitions localedef" >&2
+                        echo "       needs (/usr/share/i18n/locales/${lang}) are absent." >&2
+                        echo "       A build image gets both from locales-all; a host" >&2
+                        echo "       build needs locales or locales-all installed." >&2
+                        exit 1
+                    fi
+                    # localedef writes into the archive unless the output path
+                    # contains a slash, and refuses to create the directory, hence
+                    # the mkdir. -c because it exits non-zero on warnings, which
+                    # set -e would otherwise turn into a failed build.
+                    rm -rf "${BUNDLE}/lib/locale/${base}"
+                    mkdir -p "${BUNDLE}/lib/locale/${base}"
+                    if ! localedef -c -i "${lang}" -f "${charset}" \
+                            "${BUNDLE}/lib/locale/${base}" >/dev/null 2>&1; then
+                        echo "ERROR: localedef failed for '${want}'" >&2
+                        echo "       (locale ${lang}, charmap ${charset})" >&2
+                        exit 1
+                    fi
+                    bundled_locales+=("${base}")
+                    printf '  lib/locale/%s (%s, compiled)\n' "${base}" \
+                        "$(du -sh "${BUNDLE}/lib/locale/${base}" | cut -f1)"
+                    continue
+                fi
+                base="$(basename "${src}")"
+                # -L on purpose, and it is not a preference. A locale directory
+                # is largely symlinks into *other* locales: Debian's
+                # locales-all gives zh_CN.utf8 eight links out of twelve
+                # categories, pointing at yue_HK, bo_CN, ug_CN, aa_DJ.utf8 and
+                # cmn_TW, and its en_US.utf8 is 12 KB of real files that become
+                # 2.9 MB once resolved. Copying the links verbatim would leave a
+                # directory of dangling links, which the self-containment check
+                # below rejects -- and resolving them costs from about 0.4 MB to
+                # 3 MB a locale, depending on how much of it was shared.
+                rm -rf "${BUNDLE}/lib/locale/${base}"
+                cp -rL --preserve=mode "${src}" "${BUNDLE}/lib/locale/"
+                bundled_locales+=("${base}")
+                printf '  lib/locale/%s (%s)\n' "${base}" \
+                    "$(du -sh "${BUNDLE}/lib/locale/${base}" | cut -f1)"
+            done
+        fi
+
+        # A locale that lost a category file is not a partial locale: setlocale()
+        # fails outright. Check now, while the message can still name the locale,
+        # rather than leaving it to be discovered as "invalid locale name" on the
+        # machine the bundle was built for.
+        for base in "${bundled_locales[@]}"; do
+            for cat in LC_CTYPE LC_COLLATE LC_NUMERIC LC_TIME LC_MONETARY \
+                       LC_MESSAGES LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE \
+                       LC_MEASUREMENT LC_IDENTIFICATION; do
+                if [[ ! -e "${BUNDLE}/lib/locale/${base}/${cat}" ]]; then
+                    echo "ERROR: lib/locale/${base} came out without ${cat};" >&2
+                    echo "       refusing to ship a locale that cannot load." >&2
+                    exit 1
+                fi
+            done
+        done
+        echo "  checked: every bundled locale has all 12 categories"
+    fi
+
     echo "=== Step 11c: Patch server modules and collect their deps ==="
     shopt -s nullglob
     for ext in "${BUNDLE}/lib/postgresql/"*.so; do
@@ -609,14 +770,7 @@ REAL_BIN=$SELF_DIR/$BASENAME.real
 [ -x "$LD_LINUX" ] || { echo "$BASENAME: missing bundled loader $LD_LINUX" >&2; exit 127; }
 [ -x "$REAL_BIN" ] || { echo "$BASENAME: missing $REAL_BIN" >&2; exit 127; }
 
-# C.UTF-8 is locale *data*, not part of libc, and initdb aborts with "invalid
-# locale name" when it cannot read it. Point glibc at the bundle's copy only
-# when the host has none: a host that does keeps its own, and with it the
-# locale-archive lookup that setting LOCPATH would switch off.
-if [ ! -d /usr/lib/locale/C.utf8 ] && [ -d "$LIB_DIR/locale/C.utf8" ]; then
-    LOCPATH=$LIB_DIR/locale
-    export LOCPATH
-fi
+@LOCPATH_BLOCK@
 
 @PL_ENV_BLOCK@
 
@@ -626,6 +780,18 @@ fi
 exec "$LD_LINUX" --inhibit-cache --library-path "$LIB_DIR" "$REAL_BIN" "$@"
 WRAPOF
 )"
+
+# A mistyped placeholder is not an error anywhere else -- the substitution just
+# does nothing and the launchers come out without that block, which shows up on
+# the target machine as "invalid locale name" long after the build said it was
+# fine. Cheap to check here.
+case "${WRAPPER_TMPL}" in
+    *@LOCPATH_BLOCK@*) ;;
+    *)
+        echo "ERROR: the launcher template has no @LOCPATH_BLOCK@ placeholder" >&2
+        exit 1
+        ;;
+esac
 
 PL_ENV_BLOCK=""
 if [[ "${WITH_SERVER}" = true ]]; then
@@ -659,6 +825,39 @@ PLENV
     PL_ENV_BLOCK="${PL_ENV_BLOCK//@TCL_VER@/${TCL_VER}}"
 fi
 
+# Which LOCPATH rule goes into the launchers. Both variants live here as
+# quoted heredocs so that $LIB_DIR is left for the launcher to expand; an
+# unquoted one would bake in this build's path, exactly the mistake the
+# PL_ENV_BLOCK above has to escape around.
+if [[ ${#bundled_locales[@]} -gt 0 ]]; then
+    LOCPATH_BLOCK="$(cat <<'LOCPATHOF'
+# This bundle carries locales of its own, so it takes the locale path: the
+# locales asked for at build time have to resolve on a host that has none.
+# LOCPATH adds to the search rather than replacing it -- glibc still looks in
+# its own directory, which is why /usr/lib/locale is named below -- but it does
+# switch off the locale-archive entirely (glibc consults the archive only when
+# locale_path is NULL), so a host that keeps its locales in one loses the ones
+# that are only there. Everything named here is found first.
+if [ -d "$LIB_DIR/locale" ]; then
+    LOCPATH=$LIB_DIR/locale:/usr/lib/locale
+    export LOCPATH
+fi
+LOCPATHOF
+)"
+else
+    LOCPATH_BLOCK="$(cat <<'LOCPATHOF'
+# C.UTF-8 is locale *data*, not part of libc, and initdb aborts with "invalid
+# locale name" when it cannot read it. Point glibc at the bundle's copy only
+# when the host has none: a host that does keeps its own, and with it the
+# locale-archive lookup that setting LOCPATH would switch off.
+if [ ! -d /usr/lib/locale/C.utf8 ] && [ -d "$LIB_DIR/locale/C.utf8" ]; then
+    LOCPATH=$LIB_DIR/locale
+    export LOCPATH
+fi
+LOCPATHOF
+)"
+fi
+
 for bin in "${BUNDLE}/bin/"*; do
     [[ -f "${bin}" ]] || continue
     bname="$(basename "${bin}")"
@@ -671,6 +870,7 @@ for bin in "${BUNDLE}/bin/"*; do
 
     wrapper="${WRAPPER_TMPL//@LD_LINUX_NAME@/${LD_LINUX_NAME}}"
     wrapper="${wrapper//@PL_ENV_BLOCK@/${block}}"
+    wrapper="${wrapper//@LOCPATH_BLOCK@/${LOCPATH_BLOCK}}"
 
     mv "${bin}" "${bin}.real"
     printf '%s\n' "${wrapper}" > "${bin}"
