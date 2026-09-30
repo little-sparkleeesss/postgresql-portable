@@ -456,6 +456,19 @@ recipe_dep_present() {   # <spec>
     esac
 }
 
+# What a recipe knows about its extension that the bundle cannot work out on
+# its own, collected here and written into the bundle at the end.
+#
+# It has to be carried *in* the bundle rather than read from the recipe later:
+# verify.sh is handed a finished bundle, sometimes one built on another
+# machine, and mounts it read-only in a container where no recipe exists. The
+# only thing that travels with the bundle is the bundle.
+#
+# Written late rather than here because Step 4 empties the bundle first.
+EXT_PRELOAD_NAMES=()      # control names whose module must be preloaded
+EXT_VERIFY_STAGE=""       # directory holding the recipes' ext_verify bodies
+EXT_VERIFY_NAMES=()       # control names that declared one
+
 build_extensions() {
     local dir recipe name tarball got strip marker before after
     local ext_src f n dep
@@ -510,7 +523,8 @@ build_extensions() {
         # otherwise inherit the previous recipe's, and quietly probe for the
         # wrong thing.
         unset EXT_DESC EXT_URL EXT_SHA256 EXT_DEPS EXT_STRIP
-        unset -f ext_build
+        unset EXT_PRELOAD
+        unset -f ext_build ext_verify
         # shellcheck source=/dev/null
         source "${recipe}"
 
@@ -692,6 +706,30 @@ build_extensions() {
             printf '  installed: %s\n' "${ext_added[*]}"
         else
             printf '  installed: no .control file, so nothing for CREATE EXTENSION\n'
+        fi
+
+        # What the recipe declared about verifying its extension, kept per
+        # control name -- the name CREATE EXTENSION wants, not the recipe's.
+        #
+        # Everything here is inside the ext_added guard because "${arr[@]}" on
+        # an empty array is an unbound-variable error under set -u before bash
+        # 4.4, and this script only promises 4.x. A recipe that installed no
+        # .control file has nothing to declare anything about anyway.
+        if [[ ${#ext_added[@]} -gt 0 ]]; then
+            if [[ -n "${EXT_PRELOAD:-}" && "${EXT_PRELOAD}" != "0" ]]; then
+                EXT_PRELOAD_NAMES+=("${ext_added[@]}")
+                printf '  needs preloading: %s\n' "${ext_added[*]}"
+            fi
+            if declare -F ext_verify >/dev/null; then
+                if [[ -z "${EXT_VERIFY_STAGE}" ]]; then
+                    EXT_VERIFY_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pg-ext-verify.XXXXXX")"
+                fi
+                for n in "${ext_added[@]}"; do
+                    declare -f ext_verify > "${EXT_VERIFY_STAGE}/${n}.sh"
+                    EXT_VERIFY_NAMES+=("${n}")
+                done
+                printf '  declared a verification: %s\n' "${ext_added[*]}"
+            fi
         fi
 
         rm -rf "${ext_src}"
@@ -1505,6 +1543,47 @@ if [[ "${WITH_SERVER}" = true ]]; then
     ls "${BUNDLE}/share/" 2>/dev/null || echo "  (none)"
     echo "--- lib/postgresql/ (first 10) ---"
     ls "${BUNDLE}/lib/postgresql/" 2>/dev/null | head -10 || echo "  (none)"
+fi
+
+# -- What the recipes said about verifying themselves -------------------
+# Written last, because Step 4 empties the bundle and everything between here
+# and there fills it again.
+#
+# This is the half of a recipe that survives the build. verify.sh is given a
+# finished bundle -- on another machine, with no recipes anywhere near it --
+# and has to know two things it cannot derive from the control files: which
+# modules have to be in shared_preload_libraries before their extension can
+# even be created, and how to tell that an extension that loaded actually
+# works. Both are properties of the extension, both are known to the recipe,
+# and neither exists anywhere in a PostgreSQL installation.
+#
+# Keeping them here rather than in verify.sh is what lets a new recipe be one
+# file. A hardcoded list in verify.sh would have to be edited for every
+# extension that needed preloading, and a hardcoded test would have to be
+# written for every extension with an index AM or a background worker -- which
+# is every extension worth verifying.
+if [[ ${#EXT_PRELOAD_NAMES[@]} -gt 0 || ${#EXT_VERIFY_NAMES[@]} -gt 0 ]]; then
+    META="${BUNDLE}/.pg-portable"
+    mkdir -p "${META}/verify"
+    if [[ ${#EXT_PRELOAD_NAMES[@]} -gt 0 ]]; then
+        printf '%s\n' "${EXT_PRELOAD_NAMES[@]}" > "${META}/preload"
+    fi
+    if [[ -n "${EXT_VERIFY_STAGE}" ]]; then
+        for n in "${EXT_VERIFY_NAMES[@]}"; do
+            cp -p -- "${EXT_VERIFY_STAGE}/${n}.sh" "${META}/verify/${n}.sh"
+        done
+    fi
+    echo ""
+    echo "=== Extension metadata (${META#"${BUNDLE}"/}) ==="
+    if [[ -f "${META}/preload" ]]; then
+        printf '  preload: %s\n' "$(tr '\n' ' ' < "${META}/preload")"
+    fi
+    if [[ ${#EXT_VERIFY_NAMES[@]} -gt 0 ]]; then
+        printf '  verification: %s\n' "${EXT_VERIFY_NAMES[*]}"
+    fi
+fi
+if [[ -n "${EXT_VERIFY_STAGE}" ]]; then
+    rm -rf -- "${EXT_VERIFY_STAGE}"
 fi
 
 echo ""

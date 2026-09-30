@@ -178,6 +178,46 @@ expect_eq() {
 psql_q() { "${PG}/bin/psql" -h "${WORK}" -p "${PORT}" -U postgres -d postgres -X -q -t -A "$@"; }
 psql_c() { "${PG}/bin/psql" -h "${WORK}" -p "${PORT}" -U postgres -d postgres -X -q "$@"; }
 
+# -- shared_preload_libraries, worked out once ------------------------
+# Some extensions cannot be created at all unless their module is already in
+# shared_preload_libraries: they install hooks or define GUCs in _PG_init,
+# which only runs at postmaster startup. PostgreSQL's own pg_stat_statements
+# is one, and it is the one this script has always carried, so it is named
+# here -- it has no recipe and nothing else would declare it.
+#
+# For everything a recipe built, the answer is in the bundle:
+# .pg-portable/preload lists the extensions whose recipes said so. That file
+# is written by bundle.sh out of what each recipe declared, which is the point
+# -- this script cannot know which extensions need preloading, and a list here
+# would have to be edited for every one of them.
+#
+# The library name is module_pathname where the control file has one, since
+# that is what the module is called; the extension's name is only a fallback
+# for the rare module that does not.
+PRELOAD_LIBS="pg_stat_statements"
+if [ -f "${PG}/.pg-portable/preload" ]; then
+    while read -r _pre; do
+        [ -n "${_pre}" ] || continue
+        case ",${VERIFY_EXTENSIONS:-}," in
+            *",${_pre},"*) ;;
+            *) continue ;;
+        esac
+        _plib=$(sed -n \
+            "s/^[[:space:]]*module_pathname[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" \
+            "${PG}/share/postgresql/extension/${_pre}.control" 2>/dev/null | head -n 1)
+        # module_pathname is written for LOAD, which expands $libdir, and most
+        # control files spell it "$libdir/foo". Either spelling would work in
+        # shared_preload_libraries, but the bare name is what the line printed
+        # below should read as, so take the last path component.
+        case "${_plib}" in
+            */*) _plib="${_plib##*/}" ;;
+        esac
+        [ -n "${_plib}" ] || _plib="${_pre}"
+        PRELOAD_LIBS="${PRELOAD_LIBS},${_plib}"
+    done < "${PG}/.pg-portable/preload"
+fi
+unset _pre _plib
+
 # -- 0. toolchain sanity ----------------------------------------------
 printf '\n-- version and relocation --\n'
 run "psql --version" "${PG}/bin/psql" --version
@@ -292,6 +332,58 @@ else
     bad "NLS catalogues bundled (share/locale)" /dev/null
 fi
 
+# -- 3a. restart with the preload list --------------------------------
+# Before 3b, not after it: an extension that needs preloading cannot be
+# created until the server has been restarted with it, so a restart that came
+# later would leave those CREATE EXTENSION checks failing for a reason that
+# has nothing to do with the bundle.
+printf '\n-- preload list, before any extension is created --\n'
+printf '  loading: %s\n' "${PRELOAD_LIBS}"
+# The list is printed rather than put in the check's name: run() writes its log
+# to ${WORK}/log.<name>, and a name derived from the list is only as safe as
+# the list.
+run "pg_ctl restart with the preload list" \
+    "${PG}/bin/pg_ctl" -D "${WORK}/data" -l "${WORK}/pg.log" \
+    -o "-p ${PORT} -k ${WORK} -c shared_preload_libraries=${PRELOAD_LIBS}" -w restart
+
+# -- creating an extension, and whatever it requires --------------------
+# A .control file can declare `requires`, and PostgreSQL refuses CREATE
+# EXTENSION until those are installed. Which order the caller happened to list
+# names in is not something a caller should have to know -- an extension whose
+# control file requires another fails without it, and the reason is in a file
+# the caller never sees.
+#
+# So it is read from the bundle rather than asked for. A requirement that the
+# bundle has is created first, with the same real CREATE EXTENSION assertion as
+# a name the caller gave; one the bundle does not have is a failure that names
+# what was missing rather than a confusing error from PostgreSQL.
+#
+# $1 rather than a variable of its own throughout: a shell saves and restores
+# the positional parameters around a function call, which is the only local
+# storage POSIX sh gives, and run() parks its own first argument in a global
+# "name" that a variable here would collide with.
+EXT_CREATED=" "
+ext_requires() {   # <name> -> its control file's requires, space separated
+    sed -n "s/^[[:space:]]*requires[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" \
+        "${PG}/share/postgresql/extension/$1.control" 2>/dev/null \
+        | head -n 1 | tr ',' ' '
+}
+create_ext() {   # <name>
+    case "${EXT_CREATED}" in *" $1 "*) return 0 ;; esac
+    for _r in $(ext_requires "$1"); do
+        if [ -f "${PG}/share/postgresql/extension/${_r}.control" ]; then
+            create_ext "${_r}"
+        else
+            bad "$1 requires ${_r}, which this bundle does not have" /dev/null
+        fi
+    done
+    # Marked before the attempt, not after: a cycle in the declarations would
+    # otherwise recurse until the shell ran out of stack, and a create that
+    # failed has already been reported by the line run() prints.
+    EXT_CREATED="${EXT_CREATED}$1 "
+    run "CREATE EXTENSION $1" psql_c -c "CREATE EXTENSION \"$1\""
+}
+
 # -- 3b. extensions the bundle built (--extension) --------------------
 # The extensions a recipe installed, named from the outside. Two separate
 # things get checked, because they fail for unrelated reasons:
@@ -319,7 +411,7 @@ if [ -n "${VERIFY_EXTENSIONS:-}" ]; then
                 continue
                 ;;
         esac
-        run "CREATE EXTENSION ${extname}" psql_c -c "CREATE EXTENSION \"${extname}\""
+        create_ext "${extname}"
 
         # module_pathname is how the extension's own SQL names its library, and
         # it is the name LOAD wants too. A pure-SQL extension has none, and
@@ -339,6 +431,62 @@ if [ -n "${VERIFY_EXTENSIONS:-}" ]; then
                 "${extname}"
         fi
     done
+fi
+
+# -- 3c. whatever the recipes said would prove their extensions work ---
+# CREATE EXTENSION runs an extension's SQL and LOAD dlopens its module, and
+# for both of those the extension is a passive thing that either parses or
+# resolves. Neither touches what an extension actually does: an index access
+# method, a type's operators, a background worker's loop.
+# Those fail in a different way than a missing .control file -- an extension
+# built against a PostgreSQL whose internal structures disagree with this one
+# loads, then aborts a backend the first time a real call reaches it -- and
+# nothing above would notice.
+#
+# What counts as proof is specific to the extension, so it is the recipe's to
+# write, as ext_verify(). bundle.sh copies that function into the bundle at
+# .pg-portable/verify/<extension>.sh, and this runs it. A bundle built
+# without any such recipe has no such directory and this does nothing; a new
+# recipe needs nothing added here.
+#
+# The function runs in this shell, so it has psql_c, psql_q, run, ok, bad and
+# expect, and $PG, $WORK and $PORT. It is sourced into a POSIX sh, which is
+# the one thing its author has to know.
+if [ -n "${VERIFY_EXTENSIONS:-}" ] && [ -d "${PG}/.pg-portable/verify" ]; then
+    for extname in $(printf '%s' "${VERIFY_EXTENSIONS}" | tr ',' ' '); do
+        extverify="${PG}/.pg-portable/verify/${extname}.sh"
+        [ -f "${extverify}" ] || continue
+        printf '\n-- verification declared by the %s recipe --\n' "${extname}"
+
+        # Parsed before it is sourced. A script that will not parse is fatal
+        # to the shell that sources it, which here would take the whole run
+        # down in the middle of it -- no further checks, no summary, and an
+        # image reported as failed with nothing saying why. sh -n turns that
+        # into one failed line. It is a real risk rather than a theoretical
+        # one: the body was written by a recipe author and is read back by
+        # whatever /bin/sh this image has, which is dash on Debian.
+        if ! /bin/sh -n "${extverify}" 2>"${WORK}/log.verify.${extname}"; then
+            bad "${extname}: the recipe's ext_verify is not POSIX sh" \
+                "${WORK}/log.verify.${extname}"
+            continue
+        fi
+
+        # Sourced into this shell rather than run in a subshell, because
+        # ok/bad/expect bump counters that live here: a recipe's checks have
+        # to be counted like any other, and a subshell would print them and
+        # drop them. unset -f on both sides so that two recipes which both
+        # define ext_verify cannot have the second one run under the first
+        # one's body.
+        unset -f ext_verify 2>/dev/null || true
+        . "${extverify}"
+        if [ "$(command -v ext_verify)" = "ext_verify" ]; then
+            ext_verify
+        else
+            bad "${extname}: the recipe's verification defines no ext_verify" /dev/null
+        fi
+        unset -f ext_verify 2>/dev/null || true
+    done
+    unset extname extverify
 fi
 
 # -- 4. plpgsql -------------------------------------------------------
@@ -508,7 +656,7 @@ expect "restored row count" "1000" "${WORK}/restored.txt"
 # clearest test of the pkglibdir relocation.
 printf '\n-- shared_preload_libraries --\n'
 run "pg_ctl restart with preload" "${PG}/bin/pg_ctl" -D "${WORK}/data" -l "${WORK}/pg.log" \
-    -o "-p ${PORT} -k ${WORK} -c shared_preload_libraries=pg_stat_statements" -w restart
+    -o "-p ${PORT} -k ${WORK} -c shared_preload_libraries=${PRELOAD_LIBS}" -w restart
 run "CREATE EXTENSION pg_stat_statements" psql_c -c 'CREATE EXTENSION pg_stat_statements'
 psql_q -c 'SELECT count(*) > 0 FROM pg_stat_statements' > "${WORK}/pss.txt" 2>&1
 expect "pg_stat_statements usable" "t" "${WORK}/pss.txt"
