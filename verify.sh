@@ -95,6 +95,20 @@ else
     MOUNT_OPTS=":ro"
 fi
 
+# The scratch directory needs a relabel too, and for the opposite reason: the
+# other two mounts are read-only, and this one is the only place the container
+# writes. Without :Z on an SELinux host the mount goes through with no error
+# and then refuses every write -- "cannot create /work/log.initdb: Permission
+# denied" -- which reads like a bundle problem and is not one. The chmod 777
+# below covers the ownership half (the container runs as uid 65534, which no
+# host account owns under rootless podman); this covers the label half, and
+# both are needed.
+if [[ "${RUNTIME}" = "podman" ]]; then
+    WORK_MOUNT_OPTS=":Z"
+else
+    WORK_MOUNT_OPTS=""
+fi
+
 # -- test payload -----------------------------------------------------
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}" 2>/dev/null || true' EXIT
@@ -558,7 +572,7 @@ for IMAGE in "${IMAGES[@]}"; do
         -e HOME=/work \
         -e "VERIFY_EXTENSIONS=${VERIFY_EXTENSIONS:-}" \
         -v "${BUNDLE_ABS}:/opt/pg${MOUNT_OPTS}" \
-        -v "${IMGDIR}:/work" \
+        -v "${IMGDIR}:/work${WORK_MOUNT_OPTS}" \
         -v "${WORKDIR}/inner.sh:/inner.sh${MOUNT_OPTS}" \
         "${IMAGE}" /bin/sh /inner.sh; then
         echo "== ${IMAGE}: OK"

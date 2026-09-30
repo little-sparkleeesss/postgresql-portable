@@ -1289,8 +1289,27 @@ else
     echo "Mode: ${BUILD_MODE} (${MODE_DESC})"
 
     # Run as the invoking user so the bundle is not left owned by root.
+    #
+    # --user alone does not mean that under rootless podman, and the two halves
+    # are worth separating. Docker's daemon maps the container's uids itself,
+    # so "--user $(id -u)" is the invoking user. Rootless podman does not: it
+    # maps container uid 0 to the invoking user and everything above it into
+    # the *subuid* range, so container uid 1000 is host uid 525288 here, not
+    # whoever ran the build. The bind-mounted output then comes back owned by a
+    # uid that only the subuid map can name, and any write the container makes
+    # as root -- bundle.sh takes its lock before the compile, for one -- is a
+    # permission error rather than a build.
+    #
+    # --userns=keep-id is the half that makes the two agree: it maps the
+    # invoking uid to the same uid inside. It is a podman option, so it goes on
+    # only where the runtime is podman -- docker rejects the flag outright.
+    USERNS_ARGS=()
+    if [[ "${RUNTIME}" = "podman" ]]; then
+        USERNS_ARGS=(--userns=keep-id)
+    fi
     "${RUNTIME}" run --rm \
         --user "$(id -u):$(id -g)" \
+        ${USERNS_ARGS[@]+"${USERNS_ARGS[@]}"} \
         -e "HOME=/tmp" \
         -e "PG_VERSION=${VERSION}" \
         -e "BUILD_MODE=${BUILD_MODE}" \
