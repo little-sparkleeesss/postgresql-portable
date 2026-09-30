@@ -411,9 +411,19 @@ recipe_has_cmd() {   # cmd:a,b -> any of those commands in PATH
 }
 
 recipe_has_hdr() {   # hdr:a/b.h,c/d.h -> first hit under the include roots
+    # The llvm roots are for clang's headers, which do not always live under
+    # /usr/include: Debian's libclang is only at /usr/lib/llvm-14/include, and
+    # Fedora symlinks its copy into /usr/lib64/llvm22/include. That package
+    # ships no .pc file either, so the pkg-config half of a lib: probe cannot
+    # reach it and the header is the only way to answer. They are globs rather
+    # than pinned versions because the major is the distribution's business --
+    # the same reason a probe names a capability and not a package. build.sh's
+    # copy of this probe has the same roots, so a recipe's hdr: spec answers
+    # the same way on a host build.
     local p root
     for p in ${1//,/ }; do
-        for root in /usr/include /usr/local/include /usr/include/*/; do
+        for root in /usr/include /usr/local/include /usr/include/*/ \
+                    /usr/lib/llvm-*/include /usr/lib64/llvm*/include; do
             [[ -f "${root}/${p}" ]] && return 0
         done
     done
@@ -453,6 +463,29 @@ build_extensions() {
     local -A ctl_before=()
 
     echo "=== Step 3b: Build extensions (from source) ==="
+
+    # What the recipes' setup asked for, written while the image was built.
+    #
+    # A recipe's ext_setup() runs as root in that build and installs whatever
+    # apt could not supply; rustup's cargo is not on the default PATH and a
+    # JDK's JAVA_HOME is not set, so the setup leaves the assignments here
+    # rather than in a profile the build shell would never read -- it is not a
+    # login shell, and it is not root.
+    #
+    # Applied before the loop rather than around ext_build, because the first
+    # thing to look a dependency up by name is the capability probe below, and
+    # that runs before any recipe code does.
+    # -s, not -f: the image touches the file whether or not any recipe wrote
+    # to it, and a header with nothing under it is noise in every build that
+    # named no ext_setup.
+    if [[ -s /etc/pg-portable.env ]]; then
+        echo "Recipe environment:"
+        sed 's/^/  /' /etc/pg-portable.env
+        set -a
+        # shellcheck source=/dev/null
+        . /etc/pg-portable.env
+        set +a
+    fi
 
     for dir in "${ext_specs[@]}"; do
         dir="${dir%/}"
@@ -519,9 +552,12 @@ build_extensions() {
                     echo "       the distribution's business, and build.sh's table" >&2
                     echo "       of them covers the core and nothing else." >&2
                 else
-                    echo "       Add it to the Containerfile: that apt list is" >&2
-                    echo "       where a recipe's build dependencies belong, and" >&2
-                    echo "       nothing is installed while this image runs." >&2
+                    echo "       Add it to the recipe: EXT_APT names the" >&2
+                    echo "       packages the build image's apt provides, and" >&2
+                    echo "       ext_setup() installs what apt cannot supply." >&2
+                    echo "       build.sh runs both while the image is being" >&2
+                    echo "       built, which is where a package can still be" >&2
+                    echo "       installed -- this container has no apt lists." >&2
                 fi
                 exit 1
             fi

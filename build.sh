@@ -70,22 +70,29 @@ Extensions:
                        starts with '/', './' or '../'.
 
                        Both forms are repeatable and mix freely, and both need
-                       --full. Nothing is fetched inside the build container:
-                       the source is downloaded here, verified against the
-                       recipe's own EXT_SHA256, cached under the cache
+                       --full. The recipe's source is not fetched inside the
+                       build container: it is downloaded here, verified against
+                       the recipe's own EXT_SHA256, cached under the cache
                        directory, and mounted read-only -- so --no-download
                        reaches extensions exactly the way it reaches the
-                       PostgreSQL tarball. The extension is then compiled
+                       PostgreSQL tarball. What a recipe fetches *for itself*
+                       is its own business, and ext_build runs with the
+                       network: a dependency tree, a data blob or a toolchain
+                       installer is downloaded there, not here, and is
+                       therefore not pinned by anything. extensions/README.md
+                       has the contract. The extension is then compiled
                        against the prefix this build installed, in the same
                        image as the server, which is what lets the ordinary
                        copy and dependency walk take it in: a module linked
                        against the same glibc and OpenSSL as the binaries
                        beside it needs no machinery of its own.
-                       A recipe's own dependencies (EXT_DEPS) are probed: in
-                       the build image they are the Containerfile's business,
-                       and on a host build they are reported, never installed
-                       -- the package that provides a capability is named
-                       differently on every distribution.
+                       A recipe's own dependencies are declared in the recipe
+                       and installed while the image is built: EXT_APT names
+                       packages apt has, ext_setup() installs what it does
+                       not. EXT_DEPS is the probe for both -- a missing one is
+                       named before anything is unpacked, and on a host build
+                       nothing is installed at all, since the packages are
+                       named for the image's distribution.
 
 Host build:
   --without-container  Compile on this machine instead of in a container. Needs
@@ -223,20 +230,116 @@ fi
 # against.
 EXT_RECIPES=()      # absolute paths, one per --extension
 EXT_NAMES=()        # what to call each in the log and in the cache
-EXT_HEADERS=()      # "url|sha256|deps|description", parallel to the above
+EXT_HEADERS=()      # "url|sha256|deps|description|apt",
+EXT_SETUP_TEXTS=()  # each recipe's ext_setup() body, or "" if it has none
+                    # parallel to the above
+# What the recipes asked the image for, filled in with the rest by
+# resolve_extensions -- which a build naming no --extension never calls, so
+# these start empty here rather than only being assigned there.
+EXT_APT_ARG=""
 
-ext_recipe_header() {   # <recipe> -> "url|sha256|deps|description"
+ext_recipe_header() {   # <recipe> -> "url|sha256|deps|description|apt"
     # Sourced in a subshell, so whatever a recipe does at its top level happens
     # to a copy of this shell rather than to the one running the build. A
     # recipe is not *supposed* to do anything there, but the point of doing it
     # this way is not having to trust that.
+    #
+    # The first four fields keep the shape and the order they have always had,
+    # because that is the part every caller already reads by position. What the
+    # build image has to provide is appended rather than woven in, so that
+    # adding it changed nothing about how those four are parsed.
     bash -c '
         unset EXT_DESC EXT_URL EXT_SHA256 EXT_DEPS EXT_STRIP
+        unset EXT_APT
         # shellcheck source=/dev/null
-        source "$1"
-        printf "%s|%s|%s|%s\n" "${EXT_URL:-}" "${EXT_SHA256:-}" \
-            "${EXT_DEPS[*]:-}" "${EXT_DESC:-}"
+        source "$1" || {
+            echo "ERROR: $1 could not be read as shell." >&2
+            exit 1
+        }
+        # The description is the one field that is free text, and a "|" in it
+        # would split into two fields and shift every one after it. Refused
+        # here rather than left to ext_header_parts, which would see the wrong
+        # count and blame the wrong thing.
+        case "${EXT_DESC:-}" in
+            *"|"*)
+                echo "ERROR: a recipe declares an EXT_DESC containing a pipe," >&2
+                echo "       which is the field separator in the header this" >&2
+                echo "       function hands back. Reword it without one." >&2
+                exit 1
+                ;;
+        esac
+        printf "%s|%s|%s|%s|%s\n" "${EXT_URL:-}" "${EXT_SHA256:-}" \
+            "${EXT_DEPS[*]:-}" "${EXT_DESC:-}" \
+            "${EXT_APT[*]:-}"
     ' _ "$1"
+}
+
+# -- the body of a recipe's ext_setup() -------------------------------
+# A recipe's build dependencies that apt cannot supply are installed by shell it
+# writes itself, in ext_setup(). It runs as root, in the image, while the image
+# is being built -- the one point in this design where a recipe's code runs as
+# root rather than as the invoking user.
+#
+# The body is taken with declare -f rather than read out of the file with sed,
+# for the same reason ext_verify's is: the function is the recipe's own code,
+# and any other way of getting at it would be a second, worse parser of shell.
+# What comes back is shell that defines the function and then calls it, so each
+# recipe's setup can go into its own script and run as its own process -- two
+# recipes both naming theirs ext_setup is not a collision if nothing shares an
+# interpreter.
+ext_setup_text() {   # <recipe> -> shell on stdout, possibly empty
+    bash -c '
+        unset -f ext_setup
+        # shellcheck source=/dev/null
+        source "$1" || {
+            echo "ERROR: $1 could not be read as shell." >&2
+            exit 1
+        }
+        if declare -f ext_setup >/dev/null 2>&1; then
+            declare -f ext_setup
+            echo "ext_setup"
+        fi
+    ' _ "$1"
+}
+
+# -- reading a recipe header ------------------------------------------
+# The header is a "|"-joined string, and reading it into fewer variables than
+# it has fields does not fail: the last variable silently absorbs the rest, so
+# a header with one field more than a reader expects gives that reader's last
+# variable a value of "desc|libfoo-dev". That is how growing this header broke
+# two readers that were still taking the old number of fields, and what
+# surfaced was a checksum mismatch naming neither the header nor the reader.
+#
+# So the count is checked where the header is taken apart, in one place, rather
+# than left to each reader to get right. The fields land in ext_h_* because a
+# function cannot return several values and the callers each want a different
+# subset.
+EXT_H_FIELDS=5
+ext_header_parts() {   # <header>
+    local -a f=()
+    # read -ra, not an array assignment from an unquoted expansion: a recipe's
+    # description is free text, and word splitting plus pathname expansion on
+    # it would turn a "*" in a sentence into the contents of the working
+    # directory.
+    #
+    # The sentinel is what makes the count meaningful. read discards trailing
+    # empty fields, and most of a header is usually empty -- a recipe with no
+    # EXT_APT ends with one of them, and parsing as four fields instead of five
+    # is indistinguishable from a header that really has four. One non-empty
+    # field on the end pins the length down, so the check below can be exact
+    # rather than a guess.
+    local sentinel='pg-portable-header-end'
+    IFS='|' read -ra f <<<"$1|${sentinel}"
+    if [[ ${#f[@]} -ne $((EXT_H_FIELDS + 1)) ||
+          "${f[${EXT_H_FIELDS}]}" != "${sentinel}" ]]; then
+        echo "ERROR: internal: a recipe header does not have ${EXT_H_FIELDS}" >&2
+        echo "       fields. A reader and the emitter have drifted apart;" >&2
+        echo "       see ext_recipe_header and ext_header_parts." >&2
+        exit 1
+    fi
+    ext_h_url="${f[0]}"          ext_h_sha="${f[1]}"
+    ext_h_deps="${f[2]}"         ext_h_desc="${f[3]}"
+    ext_h_apt="${f[4]}"
 }
 
 ext_list_recipes() {
@@ -296,7 +399,9 @@ resolve_extensions() {
         esac
 
         header="$(ext_recipe_header "${file}")"
-        IFS='|' read -r url sha deps desc <<<"${header}"
+        ext_header_parts "${header}"
+        url="${ext_h_url}"; sha="${ext_h_sha}"; deps="${ext_h_deps}"
+        desc="${ext_h_desc}"; apts="${ext_h_apt}"
         if [[ -z "${url}" || -z "${sha}" ]]; then
             echo "ERROR: --extension: $(basename "${file}") declares no" >&2
             echo "       EXT_URL / EXT_SHA256, so there is nothing to fetch and" >&2
@@ -309,6 +414,28 @@ resolve_extensions() {
             echo "       that is not a sha256 sum: ${sha}" >&2
             exit 1
         fi
+        # What the recipe wants the build image to provide. The apt names are
+        # checked against a strict character set rather than taken on trust,
+        # because they end up in a shell command inside the image build: an
+        # apt-get install, which runs as root, with the network -- the one
+        # place in this design where a recipe's text becomes a command with
+        # those two things. ext_setup() is not checked here because it does not
+        # go through this: it is shell the recipe wrote deliberately, and it
+        # runs as its own script.
+        #
+        # A Debian package name is letters, digits, "+", "-", "." and an
+        # optional ":arch". Nothing else can be one, so refusing the rest costs
+        # nothing real.
+        for apt in ${apts}; do
+            if [[ ! "${apt}" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?$ ]]; then
+                echo "ERROR: --extension: $(basename "${file}") asks for the" >&2
+                echo "       package '${apt}', which is not a package name." >&2
+                echo "       EXT_APT takes Debian package names -- letters," >&2
+                echo "       digits, '+', '-', '.', and an optional ':arch'." >&2
+                exit 1
+            fi
+        done
+
         # The same three kinds of probe bundle.sh accepts. Checked here as well
         # because this is where a typo can still be answered cheaply, and
         # because a spec that is not one of the three has no probe function
@@ -328,7 +455,37 @@ resolve_extensions() {
         EXT_RECIPES+=("${file}")
         EXT_NAMES+=("$(basename "${file}" .sh)")
         EXT_HEADERS+=("${header}")
+        EXT_SETUP_TEXTS+=("$(ext_setup_text "${file}")")
     done
+
+    # -- what the recipes want the build image to have --------------------
+    # Collected across every --extension and handed to the image build as a build
+    # argument, which is what keeps a recipe from having to edit the Containerfile.
+    #
+    # The image is built before anything runs in it, and a package a recipe
+    # names is installed there, by the same apt and the same signatures as
+    # build-essential and libssl-dev. It has to be there rather than in the
+    # running container because installing it is apt's job, and apt is not what
+    # a recipe has: the image's lists are emptied once it is built.
+    #
+    # Sorted and deduplicated so that two recipes wanting the same package, or the
+    # same recipe set listed in another order, produce the same argument and
+    # therefore the same image layer -- otherwise every permutation of
+    # --extension would rebuild it.
+    EXT_APT_UNION=()
+    if [[ ${#EXT_HEADERS[@]} -gt 0 ]]; then
+        for h in "${EXT_HEADERS[@]}"; do
+            ext_header_parts "${h}"
+            apts="${ext_h_apt}"
+            for a in ${apts}; do EXT_APT_UNION+=("${a}"); done
+        done
+    fi
+    EXT_APT_ARG=""
+    if [[ ${#EXT_APT_UNION[@]} -gt 0 ]]; then
+        EXT_APT_ARG="$(printf '%s\n' "${EXT_APT_UNION[@]}" | sort -u | tr '\n' ' ')"
+        EXT_APT_ARG="${EXT_APT_ARG% }"
+    fi
+    unset h apts a
 }
 
 # -- validate --locales -----------------------------------------------
@@ -508,9 +665,17 @@ probe_cmd() {   # cmd:a,b -> any of those commands in PATH
 
 probe_hdr() {   # hdr:a/b.h,c/d.h -> first hit under the include roots
     # The trailing slash matters: /usr/include has none, the glob entries do.
+    #
+    # The llvm roots are for clang's headers, which do not always live under
+    # /usr/include: Debian's libclang is only at /usr/lib/llvm-14/include, and
+    # Fedora symlinks its copy into /usr/lib64/llvm22/include. That package
+    # ships no .pc file either, so the pkg-config half of a lib: probe cannot
+    # reach it. The same roots are in bundle.sh's copy of this probe, so a
+    # recipe's hdr: spec answers the same way on a host build as in the image.
     local p root
     for p in ${1//,/ }; do
-        for root in /usr/include /usr/local/include /usr/include/*/; do
+        for root in /usr/include /usr/local/include /usr/include/*/ \
+                    /usr/lib/llvm-*/include /usr/lib64/llvm*/include; do
             if [[ -f "${root}/${p}" ]]; then return 0; fi
         done
     done
@@ -960,7 +1125,8 @@ check_recipe_deps() {
     local i dep name entry
     local -a missing=()
     for i in "${!EXT_RECIPES[@]}"; do
-        IFS='|' read -r _url _sha deps _desc <<<"${EXT_HEADERS[i]}"
+        ext_header_parts "${EXT_HEADERS[i]}"
+        deps="${ext_h_deps}"
         name="${EXT_NAMES[i]}"
         for dep in ${deps}; do
             dep_probe "${dep}" || missing+=("${name}|${dep}")
@@ -980,10 +1146,39 @@ check_recipe_deps() {
     echo "table above names the core's by hand."
 }
 
+# The packages a recipe asked for, which a container build installs into the
+# image and a host build cannot: they are Debian package names, and this
+# machine may not be Debian. Reported rather than installed, and reported by
+# name because here the name is exactly what the recipe wrote -- a host build
+# has no package manager table for a recipe's dependencies, only for the
+# core's.
+check_recipe_apt() {
+    local i apt name
+    [[ -n "${EXT_APT_ARG}" ]] || return 0
+    for i in "${!EXT_RECIPES[@]}"; do
+        ext_header_parts "${EXT_HEADERS[i]}"
+        apts="${ext_h_apt}"
+        name="${EXT_NAMES[i]}"
+        for apt in ${apts}; do
+            printf '  %-12s %s\n' "${name}" "${apt}"
+        done
+    done
+    echo ""
+    echo "A host build does not install these: they are named for the build"
+    echo "image's distribution, and this machine is not it. Install what your"
+    echo "distribution calls them and re-run, or build in a container, where"
+    echo "they are installed for you."
+}
+
 if [[ "${WITHOUT_CONTAINER}" = true ]]; then
     provision_host_deps
     if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
         check_recipe_deps
+        if [[ -n "${EXT_APT_ARG}" ]]; then
+            echo ""
+            echo "Recipes ask for these packages:"
+            check_recipe_apt
+        fi
     fi
 fi
 
@@ -1156,9 +1351,12 @@ fi
 # -- extension sources -------------------------------------------------
 # Fetched here, on the host, for the same reason the PostgreSQL tarball is: the
 # cache, the checksum and --no-download are one arrangement in one place, and
-# the build then works from a tree it can trust. It also means the build
-# container needs no network at all -- the image has no repository configured
-# and nothing is fetched from inside it.
+# the build then works from a tree it can trust. It is also what keeps
+# --no-download meaning something for a recipe: a build with no network still
+# has its source, because the source was fetched before the container started.
+#
+# What a recipe fetches for itself, in ext_build or ext_setup, is not this and
+# is not pinned by anything here -- see extensions/README.md.
 ext_fetch() {   # <name> <url> <sha256> -> path on stdout
     local name="$1" url="$2" want="$3"
     # The checksum is part of the file name, so a recipe that moves to another
@@ -1230,7 +1428,8 @@ if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
     ext_paths=()
     for ext_i in "${!EXT_RECIPES[@]}"; do
         ext_name="${EXT_NAMES[ext_i]}"
-        IFS='|' read -r ext_url ext_sha _ext_deps _ext_desc <<<"${EXT_HEADERS[ext_i]}"
+        ext_header_parts "${EXT_HEADERS[ext_i]}"
+        ext_url="${ext_h_url}"; ext_sha="${ext_h_sha}"
         ext_tarball="$(ext_fetch "${ext_name}" "${ext_url}" "${ext_sha}")"
 
         ext_dir="${EXT_STAGE}/${ext_i}"
@@ -1248,6 +1447,44 @@ if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
     EXT_TRANSPORT="$(printf '%s\n' "${ext_paths[@]}")"
     unset ext_i ext_name ext_url ext_sha ext_tarball ext_dir ext_paths
 fi
+
+# -- the image build's context ----------------------------------------
+# The Containerfile, bundle.sh, and one script per recipe that declared
+# ext_setup().
+#
+# The context is a temporary directory rather than this checkout. A recipe's
+# setup is shell -- multi-line, quoted, sometimes a heredoc -- and the only way
+# to hand that to an image build without quoting it a second time is to put it
+# in a file and COPY it, which needs the file in the context. Writing the file
+# into the checkout instead would leave generated state in a tree that is
+# otherwise only source, so the context moves rather than the file.
+#
+# The scripts are named for their recipes, so the glob that runs them is in a
+# fixed order no matter what order --extension was given in.
+prepare_image_context() {   # -> a directory on stdout
+    local ctx i
+    ctx="$(mktemp -d "${TMPDIR:-/tmp}/pg-image.XXXXXX")"
+    cp -p "${SCRIPT_DIR}/Containerfile" "${ctx}/Dockerfile"
+    cp -p "${SCRIPT_DIR}/bundle.sh" "${ctx}/bundle.sh"
+    mkdir -p "${ctx}/pg-portable-setup"
+
+    # The length test is for set -u on an empty array, which an expansion of
+    # the indices trips on where an expansion of the values does not.
+    if [[ ${#EXT_RECIPES[@]} -gt 0 ]]; then
+        for i in "${!EXT_RECIPES[@]}"; do
+            if [[ -z "${EXT_SETUP_TEXTS[i]}" ]]; then
+                continue
+            fi
+            {
+                printf '# %s: ext_setup(), from extensions/%s.sh.\n' \
+                    "${EXT_NAMES[i]}" "${EXT_NAMES[i]}"
+                printf 'set -euo pipefail\n'
+                printf '%s\n' "${EXT_SETUP_TEXTS[i]}"
+            } > "${ctx}/pg-portable-setup/${EXT_NAMES[i]}.sh"
+        done
+    fi
+    printf '%s\n' "${ctx}"
+}
 
 # -- build ------------------------------------------------------------
 case "${BUILD_MODE}" in
@@ -1275,8 +1512,42 @@ if [[ "${WITHOUT_CONTAINER}" = true ]]; then
         PG_HOST_BUILD=1 bash "${SCRIPT_DIR}/bundle.sh"
 else
     echo "=== Building image (${RUNTIME}) ==="
-    # -f is required: podman finds Containerfile on its own, docker does not.
-    "${RUNTIME}" build -f "${SCRIPT_DIR}/Containerfile" -t pg18-builder "${SCRIPT_DIR}"
+    if [[ -n "${EXT_APT_ARG}" ]]; then
+        echo "Recipe packages: ${EXT_APT_ARG}"
+    fi
+    # The recipes that will run setup in the image. Collected in --extension
+    # order and printed sorted, because sorted is the order they actually run
+    # in: the context names them for their recipes and the Containerfile globs
+    # the directory, which is filename order. Two orderings that disagree is a
+    # log that lies about the one thing it is there to say.
+    SETUP_NAMES=()
+    if [[ ${#EXT_SETUP_TEXTS[@]} -gt 0 ]]; then
+        for i in "${!EXT_SETUP_TEXTS[@]}"; do
+            if [[ -n "${EXT_SETUP_TEXTS[i]}" ]]; then
+                SETUP_NAMES+=("${EXT_NAMES[i]}")
+            fi
+        done
+    fi
+    if [[ ${#SETUP_NAMES[@]} -gt 0 ]]; then
+        SETUP_ARG="$(printf '%s\n' "${SETUP_NAMES[@]}" | sort | tr '\n' ' ')"
+        printf 'Recipe setup: %s\n' "${SETUP_ARG% }"
+    fi
+
+    # The context is generated, so the build file is named rather than
+    # discovered. The build argument is how a recipe's packages reach the image
+    # without anyone editing it; it is empty for a build with no --extension,
+    # and the image is then the one it has always been.
+    IMAGE_CTX="$(prepare_image_context)"
+    if ! "${RUNTIME}" build -f "${IMAGE_CTX}/Dockerfile" -t pg18-builder \
+        --build-arg "PG_APT_EXTRA=${EXT_APT_ARG}" \
+        "${IMAGE_CTX}"; then
+        echo "" >&2
+        echo "ERROR: the image build failed. Its context is left at" >&2
+        echo "       ${IMAGE_CTX}, with each recipe's setup script in" >&2
+        echo "       pg-portable-setup/ as it was run." >&2
+        exit 1
+    fi
+    rm -rf -- "${IMAGE_CTX}"
 
     mkdir -p "${OUT_DIR}"
 
